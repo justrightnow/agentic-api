@@ -1,0 +1,1649 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::num::NonZeroU64;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::conversations::ConversationMetadata;
+use super::io::input::{HistoryNaming, InputValidationError};
+use super::io::{FunctionTool, MultiAgentConfig, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
+use super::tools::ResponsesTool;
+use crate::tool::{
+    CodexNamespaceHandler, CustomHandler, ToolDeclaration, ToolError, declares_async, responses_declarations,
+};
+
+mod compaction;
+pub use compaction::{CompactRequest, CompactedResponse, ContextManagement};
+mod prompt_cache;
+pub use prompt_cache::{PromptCacheMode, PromptCacheOptions, PromptCacheOptionsError, PromptCacheTtl};
+mod max_tool_calls;
+mod response_stream;
+mod serde_helpers;
+mod standard_response;
+mod text_config;
+mod unsupported;
+mod upstream_input;
+pub use max_tool_calls::{JsonKind, MAX_TOOL_CALLS_PARAM, MaxToolCalls, MaxToolCallsError, OutOfRangeInteger};
+use serde_helpers::{
+    default_true, deserialize_conversation, is_absent_or_default_tool_choice, serialize_conversation_object,
+    serialize_upstream_tool_choice,
+};
+pub use standard_response::{ResponseReasoning, StandardResponseFields};
+pub use text_config::{ResponseTextConfig, ResponseTextFormat};
+pub use unsupported::{
+    BACKGROUND_PARAM, Background, PROMPT_PARAM, RejectedValue, TOOL_CHOICE_PARAM, UnsupportedParameterError,
+};
+#[cfg(feature = "openapi")]
+mod schema;
+
+/// Standard Responses API reasoning generation settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// Legacy upstream prompt-cache retention policy. Cache lifetime remains upstream-owned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum PromptCacheRetention {
+    #[serde(rename = "in_memory")]
+    InMemory,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+}
+
+/// A Responses request. Rust's derived default uses `store: false`; JSON deserialization
+/// uses `store: true` when storage is not specified. Set `store` explicitly when constructing
+/// a stored request with struct update syntax.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "Box<T>: Serialize, C: Serialize",
+    deserialize = "Box<T>: Deserialize<'de>, C: Deserialize<'de>"
+))]
+pub struct RequestPayload<T: ?Sized = ResponseTextConfig, C = PromptCacheOptions> {
+    pub model: String,
+    pub input: ResponsesInput,
+    pub instructions: Option<String>,
+    pub previous_response_id: Option<String>,
+    #[serde(default, alias = "conversation_id", deserialize_with = "deserialize_conversation")]
+    pub conversation: Option<String>,
+    pub tools: Option<Vec<ResponsesTool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default = "default_true")]
+    pub store: bool,
+    pub include: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Box<ReasoningConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<Box<T>>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub max_output_tokens: Option<u32>,
+    /// Maximum built-in tool calls one response may process, as sent by the client.
+    /// Read it through [`RequestPayload::max_tool_calls_limit`]; unsupported with multi-agent execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<MaxToolCalls>,
+    /// vLLM extension: continue generation past the end-of-sequence token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_eos: Option<bool>,
+    pub truncation: Option<String>,
+    pub metadata: Option<ConversationMetadata>,
+    pub parallel_tool_calls: Option<bool>,
+    /// Hosted collaboration configuration, interpreted by the gateway coordinator.
+    /// Independent of the model's `parallel_tool_calls` generation preference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_agent: Option<MultiAgentConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<C>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<Vec<ContextManagement>>,
+    /// Detection only, never serialized: typed execution rejects `true` (background mode is #357)
+    /// and a non-boolean value.
+    #[serde(default, skip_serializing)]
+    pub background: Option<Background>,
+    /// Detection only, never serialized: typed execution rejects any non-null value.
+    #[serde(default, skip_serializing)]
+    pub prompt: Option<RejectedValue>,
+    /// Unmodeled provider parameters (for example, `chat_template_kwargs`), forwarded unchanged.
+    /// Modeled request fields retain their typed validation and upstream conversion.
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Validation failures while constructing a typed upstream request.
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamRequestError {
+    #[error(transparent)]
+    Input(#[from] InputValidationError),
+    #[error(transparent)]
+    Tool(#[from] ToolError),
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpstreamRequest<'a> {
+    /// Disable upstream storage when the caller disables gateway storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+    pub model: &'a str,
+    pub input: Cow<'a, ResponsesInput>,
+    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<&'a str>,
+    /// Tools forwarded to vLLM. Function-like declarations are normalized to ordinary function
+    /// tools.
+    /// Skipped when empty so vLLM does not receive an empty array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<UpstreamTool>>,
+    #[serde(
+        skip_serializing_if = "is_absent_or_default_tool_choice",
+        serialize_with = "serialize_upstream_tool_choice"
+    )]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<&'a Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<&'a ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<&'a ResponseTextConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore_eos: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<&'a ConversationMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<&'a PromptCacheOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_salt: Option<&'a str>,
+    #[serde(flatten)]
+    pub extra: &'a HashMap<String, Value>,
+}
+
+/// A normalized tool declaration supported by the upstream Responses endpoint.
+///
+/// Gateway and client tool declarations are converted to function tools before
+/// entering this upstream-only payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum UpstreamTool {
+    Function(FunctionTool),
+}
+
+impl<T: ?Sized, C> RequestPayload<T, C> {
+    /// The validated `max_tool_calls` limit; `None` means no limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaxToolCallsError`] when the client sent an invalid value.
+    pub fn max_tool_calls_limit(&self) -> Result<Option<NonZeroU64>, MaxToolCallsError> {
+        self.max_tool_calls.as_ref().map(MaxToolCalls::limit).transpose()
+    }
+
+    /// Whether any declared tool makes a model-visible tool async.
+    #[must_use]
+    pub fn declares_async_tools(&self) -> bool {
+        self.tools
+            .as_deref()
+            .is_some_and(|tools| tools.iter().any(declares_async))
+    }
+
+    /// Names the feature in this request that only the in-process executor
+    /// implements, if any — neither the passthrough proxy nor split execution
+    /// can serve it.
+    #[must_use]
+    pub fn in_process_feature(&self) -> Option<&'static str> {
+        if self.multi_agent.as_ref().is_some_and(|config| config.enabled) {
+            return Some("multi_agent");
+        }
+        if self.conversation.is_some() {
+            return Some("conversation");
+        }
+        if self
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| !matches!(tool, ResponsesTool::Function(_))))
+        {
+            return Some("gateway-owned tools");
+        }
+        // The gateway emulates async tools: the model server neither marks nor continues them.
+        if self.declares_async_tools() || self.input.has_async_call() {
+            return Some("async tools");
+        }
+        if self.input.contains_compaction() || self.input.has_compaction_trigger() {
+            return Some("compaction input");
+        }
+        if self
+            .context_management
+            .as_ref()
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return Some("context_management");
+        }
+        None
+    }
+
+    /// Transform the text configuration while moving all other request fields
+    /// without reparsing or reallocating them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mapping function's error when the text configuration cannot
+    /// be transformed.
+    pub fn try_map_text<U: ?Sized, E>(
+        self,
+        map: impl FnOnce(Box<T>) -> Result<Box<U>, E>,
+    ) -> Result<RequestPayload<U, C>, E> {
+        self.try_map_configs(map, Ok)
+    }
+
+    /// Transform transport configuration views into typed execution settings.
+    /// All other request fields are moved without reparsing or reallocating them.
+    ///
+    /// # Errors
+    /// Returns either mapping function's error when a configuration cannot be transformed.
+    pub fn try_map_configs<U: ?Sized, D, E>(
+        self,
+        map_text: impl FnOnce(Box<T>) -> Result<Box<U>, E>,
+        map_cache: impl FnOnce(C) -> Result<D, E>,
+    ) -> Result<RequestPayload<U, D>, E> {
+        Ok(RequestPayload {
+            model: self.model,
+            input: self.input,
+            instructions: self.instructions,
+            previous_response_id: self.previous_response_id,
+            conversation: self.conversation,
+            tools: self.tools,
+            tool_choice: self.tool_choice,
+            stream: self.stream,
+            store: self.store,
+            include: self.include,
+            reasoning: self.reasoning,
+            text: self.text.map(map_text).transpose()?,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            max_output_tokens: self.max_output_tokens,
+            max_tool_calls: self.max_tool_calls,
+            ignore_eos: self.ignore_eos,
+            truncation: self.truncation,
+            metadata: self.metadata,
+            parallel_tool_calls: self.parallel_tool_calls,
+            prompt_cache_key: self.prompt_cache_key,
+            prompt_cache_retention: self.prompt_cache_retention,
+            prompt_cache_options: self.prompt_cache_options.map(map_cache).transpose()?,
+            service_tier: self.service_tier,
+            multi_agent: self.multi_agent,
+            cache_salt: self.cache_salt,
+            context_management: self.context_management,
+            background: self.background,
+            prompt: self.prompt,
+            extra: self.extra,
+        })
+    }
+}
+
+impl RequestPayload {
+    /// Snapshot effective settings for an automatic successor without copying
+    /// canonical item history or carrying the current response's routing.
+    /// The original request, including its input, remains unchanged.
+    pub(crate) fn continuation_settings(&mut self) -> Self {
+        let input = std::mem::take(&mut self.input);
+        let mut settings = self.clone();
+        self.input = input;
+        settings.previous_response_id = None;
+        settings.conversation = None;
+        settings
+    }
+
+    /// The Responses adapter boundary: this request's declared tools as the
+    /// tool layer's declarations, with the wire tools left in place.
+    #[must_use]
+    pub fn tool_declarations(&self) -> Option<Vec<ToolDeclaration>> {
+        self.tools.as_deref().map(responses_declarations)
+    }
+
+    /// Construct an `UpstreamRequest` suitable for forwarding to vLLM.
+    ///
+    /// Codex `namespace` tools' members are first renamed to their flat,
+    /// model-visible names via [`CodexNamespaceHandler::resolve_namespace_members`].
+    /// Namespace, gateway, and custom tools are then normalized to function
+    /// declarations. `tool_choice` is resolved the same way via
+    /// [`CodexNamespaceHandler::resolve_tool_choice`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported message content before normalization. Returns a tool
+    /// validation error when a Codex namespace member's generated
+    /// flat name collides with a top-level function tool or another namespace
+    /// member, or when a custom tool declares a format whose constrained
+    /// decoding cannot be preserved upstream.
+    pub fn to_upstream_request(&self, stream: bool) -> Result<UpstreamRequest<'_>, UpstreamRequestError> {
+        self.input.validate()?;
+        // This is only the upstream model-generation preference: it controls
+        // whether the model may emit parallel calls, not how the gateway
+        // schedules calls after inference. Forward an explicit client value;
+        // preserve this gateway's existing default of `false` when omitted.
+        // `GatewayScheduler` independently applies its bounded fan-out and each
+        // handler's same-tool parallel-safety policy to whatever calls appear.
+        let parallel_tool_calls = Some(self.parallel_tool_calls.unwrap_or(false));
+
+        let declarations = self.tool_declarations();
+        let tools = Self::upstream_tools(declarations.as_deref())?;
+        let namespace_map = CodexNamespaceHandler.build_namespace_map(declarations.as_deref())?;
+        let history = HistoryNaming {
+            functions: self.top_level_function_names(),
+        };
+        let input = self.upstream_input(namespace_map.as_ref(), &history)?;
+        let tool_choice = CodexNamespaceHandler.resolve_tool_choice(namespace_map.as_ref(), self.tool_choice.as_ref());
+        CustomHandler::validate_tool_choice(declarations.as_deref(), &tool_choice)?;
+        crate::tool::file_search::FileSearchHandler::validate_tool_choice(declarations.as_deref(), &tool_choice)?;
+        Ok(UpstreamRequest {
+            store: (!self.store).then_some(false),
+            model: &self.model,
+            input,
+            stream,
+            instructions: self.instructions.as_deref(),
+            tools,
+            tool_choice: Some(tool_choice),
+            include: self.include.as_ref(),
+            reasoning: self.reasoning.as_deref(),
+            text: self.text.as_deref(),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            max_output_tokens: self.max_output_tokens,
+            ignore_eos: self.ignore_eos,
+            truncation: self.truncation.as_deref(),
+            metadata: self.metadata.as_ref(),
+            parallel_tool_calls,
+            prompt_cache_key: self.prompt_cache_key.as_deref(),
+            prompt_cache_retention: self.prompt_cache_retention,
+            prompt_cache_options: self.prompt_cache_options.as_ref(),
+            service_tier: self.service_tier.as_deref(),
+            cache_salt: self.cache_salt.as_deref(),
+            extra: &self.extra,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct IncompleteDetails {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsePayload {
+    pub id: String,
+    pub object: String,
+    pub created_at: i64,
+    pub model: String,
+    pub status: String,
+    #[serde(default)]
+    pub output: Vec<OutputItem>,
+    pub usage: Option<ResponseUsage>,
+    pub incomplete_details: Option<IncompleteDetails>,
+    pub error: Option<Value>,
+    pub previous_response_id: Option<String>,
+    #[serde(
+        default,
+        alias = "conversation_id",
+        deserialize_with = "deserialize_conversation",
+        serialize_with = "serialize_conversation_object",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub conversation: Option<String>,
+    pub instructions: Option<String>,
+    /// The request's `max_tool_calls`, always echoed (`null` when unset). Never inherited.
+    #[serde(default)]
+    pub max_tool_calls: Option<u64>,
+    #[serde(default, serialize_with = "standard_response::serialize_response_service_tier")]
+    pub service_tier: Option<String>,
+    #[serde(default, serialize_with = "standard_response::serialize_response_tools")]
+    pub tools: Option<Vec<ResponsesTool>>,
+    #[serde(default, serialize_with = "standard_response::serialize_response_tool_choice")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(flatten)]
+    pub standard_fields: StandardResponseFields,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::types::io::InputItem;
+
+    use super::*;
+    use crate::types::io::InOutItem;
+
+    #[test]
+    fn provider_extensions_survive_mapping_and_request_round_trip() {
+        let wire = serde_json::json!({
+            "model": "test", "input": "hello", "store": false,
+            "conversation_id": "conv_test", "background": false, "prompt": null,
+            "context_management": [], "max_tool_calls": 2,
+            "chat_template_kwargs": {"enable_thinking": false}, "top_k": 20,
+            "x_provider_option": null
+        });
+        let routing: RequestPayload<serde_json::value::RawValue> = serde_json::from_value(wire.clone()).unwrap();
+        let request = routing
+            .try_map_text(|text| serde_json::from_str::<ResponseTextConfig>(text.get()).map(Box::new))
+            .unwrap();
+        let restored: RequestPayload = serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        assert_eq!(
+            restored.extra.len(),
+            3,
+            "known fields must not enter provider extensions"
+        );
+        for stream in [false, true] {
+            let upstream = serde_json::to_value(restored.to_upstream_request(stream).unwrap()).unwrap();
+            assert_eq!(upstream["stream"], stream);
+            assert_eq!(upstream["store"], false);
+            for key in ["chat_template_kwargs", "top_k", "x_provider_option"] {
+                assert_eq!(upstream.get(key), wire.get(key));
+            }
+            for key in [
+                "conversation_id",
+                "conversation",
+                "background",
+                "prompt",
+                "context_management",
+                "max_tool_calls",
+            ] {
+                assert!(upstream.get(key).is_none(), "gateway field {key} must not be forwarded");
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_cache_retention_survives_text_mapping_and_request_round_trip() {
+        for value in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("in_memory")),
+            Some(serde_json::json!("24h")),
+        ] {
+            let mut wire = serde_json::json!({"model":"test-model", "input":"hello"});
+            if let Some(value) = value {
+                wire["prompt_cache_retention"] = value;
+            }
+            let routing: RequestPayload<serde_json::value::RawValue> = serde_json::from_value(wire).unwrap();
+            let request = routing
+                .try_map_text(|text| serde_json::from_str::<ResponseTextConfig>(text.get()).map(Box::new))
+                .unwrap();
+            let stored: RequestPayload = serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            assert_eq!(stored.prompt_cache_retention, request.prompt_cache_retention);
+            for stream in [false, true] {
+                let upstream = serde_json::to_value(stored.to_upstream_request(stream).unwrap()).unwrap();
+                assert_eq!(
+                    upstream.get("prompt_cache_retention"),
+                    request
+                        .prompt_cache_retention
+                        .map(|value| serde_json::to_value(value).unwrap())
+                        .as_ref()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stored_struct_defaults_match_minimal_wire_request() {
+        let wire: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello"
+        }))
+        .unwrap();
+        let fixture: RequestPayload = RequestPayload {
+            model: "test-model".into(),
+            input: ResponsesInput::Text("hello".into()),
+            store: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(fixture).unwrap(),
+            serde_json::to_value(wire).unwrap()
+        );
+    }
+
+    #[test]
+    fn rust_defaults_do_not_make_required_wire_fields_optional() {
+        let default: RequestPayload = RequestPayload::default();
+        assert!(!default.store);
+        assert!(matches!(default.input, ResponsesInput::Items(items) if items.is_empty()));
+
+        for wire in [
+            serde_json::json!({"model": "test-model"}),
+            serde_json::json!({"input": "hello"}),
+        ] {
+            assert!(serde_json::from_value::<RequestPayload>(wire).is_err());
+        }
+    }
+
+    #[test]
+    fn request_preserves_multi_agent_independently_of_parallel_tool_calls() {
+        for enabled in [false, true] {
+            for parallel_tool_calls in [false, true] {
+                let config = serde_json::json!({"enabled": enabled, "max_concurrent_subagents": 3});
+                let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+                    "model": "test-model",
+                    "input": "Review independent tasks.",
+                    "multi_agent": config,
+                    "parallel_tool_calls": parallel_tool_calls
+                }))
+                .unwrap();
+                let payload = payload.try_map_text(Ok::<_, std::convert::Infallible>).unwrap();
+
+                assert_eq!(
+                    payload.multi_agent,
+                    Some(MultiAgentConfig {
+                        enabled,
+                        max_concurrent_subagents: Some(3),
+                    })
+                );
+                assert_eq!(serde_json::to_value(&payload).unwrap()["multi_agent"], config);
+                assert_eq!(payload.in_process_feature(), enabled.then_some("multi_agent"));
+
+                for stream in [false, true] {
+                    let upstream = serde_json::to_value(payload.to_upstream_request(stream).unwrap()).unwrap();
+                    assert!(upstream.get("multi_agent").is_none());
+                    assert_eq!(upstream["parallel_tool_calls"], parallel_tool_calls);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_preserves_max_tool_calls_for_admission() {
+        for limit in [None, Some(0), Some(5)] {
+            let mut wire = serde_json::json!({"model": "test-model", "input": "hello"});
+            if let Some(limit) = limit {
+                wire["max_tool_calls"] = limit.into();
+            }
+            let request: RequestPayload = serde_json::from_value(wire).unwrap();
+            let request = request.try_map_text(Ok::<_, std::convert::Infallible>).unwrap();
+            assert_eq!(
+                request.max_tool_calls_limit().map(|limit| limit.map(NonZeroU64::get)),
+                match limit {
+                    Some(0) => Err(MaxToolCallsError::BelowMinimum(OutOfRangeInteger::Unsigned(0))),
+                    limit => Ok(limit),
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(request).unwrap().get("max_tool_calls"),
+                limit.map(serde_json::Value::from).as_ref()
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_multi_agent_does_not_enable_collaboration() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello"
+        }))
+        .unwrap();
+        assert!(payload.multi_agent.is_none());
+        assert!(serde_json::to_value(&payload).unwrap().get("multi_agent").is_none());
+        assert_eq!(payload.in_process_feature(), None);
+    }
+
+    /// A stateless request with only function tools normally goes straight to the model server,
+    /// which ignores `async`; async tools and replayed async calls need the executor.
+    #[test]
+    fn async_tools_and_replayed_async_calls_require_the_executor() {
+        let request = |tools: serde_json::Value, input: serde_json::Value| -> RequestPayload {
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model", "store": false, "tools": tools, "input": input
+            }))
+            .unwrap()
+        };
+        let sync_tool = serde_json::json!([{"type": "function", "name": "get_weather"}]);
+        let async_tool = serde_json::json!([{"type": "function", "name": "get_weather", "async": true}]);
+        let call = |async_execution: bool| {
+            serde_json::json!([{"type": "function_call", "call_id": "call_1", "name": "get_weather",
+                "arguments": "{}", "async": async_execution}])
+        };
+
+        assert_eq!(request(sync_tool.clone(), call(false)).in_process_feature(), None);
+        assert_eq!(
+            request(async_tool, serde_json::json!("hi")).in_process_feature(),
+            Some("async tools")
+        );
+        assert_eq!(
+            request(sync_tool, call(true)).in_process_feature(),
+            Some("async tools"),
+            "a replayed async call keeps executor semantics after the tool is re-declared"
+        );
+    }
+
+    #[test]
+    fn request_payload_accepts_openai_conversation_field() {
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "conversation": "conv_test"
+        }))
+        .expect("OpenAI conversation field should deserialize");
+        assert_eq!(request.conversation.as_deref(), Some("conv_test"));
+        assert_eq!(request.in_process_feature(), Some("conversation"));
+    }
+
+    #[test]
+    fn request_payload_accepts_conversation_id_alias() {
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "conversation_id": "conv_alias"
+        }))
+        .expect("conversation_id alias should deserialize");
+        assert_eq!(request.conversation.as_deref(), Some("conv_alias"));
+        assert_eq!(request.in_process_feature(), Some("conversation"));
+    }
+
+    #[test]
+    fn request_payload_accepts_conversation_object_form() {
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "conversation": { "id": "conv_object" }
+        }))
+        .expect("conversation object form should deserialize");
+        assert_eq!(request.conversation.as_deref(), Some("conv_object"));
+        assert_eq!(request.in_process_feature(), Some("conversation"));
+    }
+
+    #[test]
+    fn request_payload_accepts_conversation_id_object_form() {
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "conversation_id": { "id": "conv_id_object" }
+        }))
+        .expect("conversation_id alias with object form should deserialize");
+        assert_eq!(request.conversation.as_deref(), Some("conv_id_object"));
+        assert_eq!(request.in_process_feature(), Some("conversation"));
+    }
+
+    #[test]
+    fn response_payload_serializes_conversation_as_object() {
+        let payload = ResponsePayload {
+            id: "resp_test".to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            model: "test-model".to_string(),
+            status: "completed".to_string(),
+            output: Vec::new(),
+            usage: None,
+            incomplete_details: None,
+            error: None,
+            previous_response_id: None,
+            conversation: Some("conv_123".to_string()),
+            instructions: None,
+            service_tier: None,
+            tools: None,
+            tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
+            max_tool_calls: None,
+        };
+
+        let json = serde_json::to_value(&payload).expect("response should serialize");
+        assert_eq!(json["conversation"]["id"], "conv_123");
+        assert!(json["conversation"].is_object());
+    }
+
+    #[test]
+    fn response_payload_omits_absent_conversation() {
+        let payload = ResponsePayload {
+            id: "resp_test".to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            model: "test-model".to_string(),
+            status: "completed".to_string(),
+            output: Vec::new(),
+            usage: None,
+            incomplete_details: None,
+            error: None,
+            previous_response_id: None,
+            conversation: None,
+            instructions: None,
+            service_tier: None,
+            tools: None,
+            max_tool_calls: None,
+            tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
+        };
+
+        let json = serde_json::to_value(&payload).expect("response should serialize");
+        assert!(json.get("conversation").is_none());
+    }
+
+    #[test]
+    fn request_payload_preserves_ignore_eos_upstream() {
+        for ignore_eos in [None, Some(false), Some(true)] {
+            let mut request = serde_json::json!({"model": "test-model", "input": "hello"});
+            if let Some(value) = ignore_eos {
+                request["ignore_eos"] = value.into();
+            }
+            let payload: RequestPayload = serde_json::from_value(request).expect("request should deserialize");
+            let payload = payload
+                .try_map_text(Ok::<_, std::convert::Infallible>)
+                .expect("text mapping should preserve request fields");
+            assert_eq!(payload.ignore_eos, ignore_eos);
+
+            for stream in [false, true] {
+                let upstream =
+                    serde_json::to_value(payload.to_upstream_request(stream).expect("request should normalize"))
+                        .expect("upstream request should serialize");
+                assert_eq!(
+                    upstream.get("ignore_eos"),
+                    ignore_eos.map(serde_json::Value::Bool).as_ref()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn request_payload_rejects_non_boolean_ignore_eos() {
+        for value in [serde_json::json!("true"), serde_json::json!(1)] {
+            assert!(
+                serde_json::from_value::<RequestPayload>(serde_json::json!({
+                    "model": "test-model", "input": "hello", "ignore_eos": value
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn compact_request_accepts_codex_compatibility_fields() {
+        let request: CompactRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": [{"role": "user", "content": "hello"}],
+            "tools": [],
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "medium"},
+            "text": {"verbosity": "low"}
+        }))
+        .expect("compact request should parse");
+
+        assert_eq!(request.model, "test-model");
+        assert!(request.input.is_some());
+        assert_eq!(request.compatibility.len(), 4);
+    }
+
+    #[test]
+    fn request_payload_omits_absent_and_forwards_present_cache_salt_upstream() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello"
+        }))
+        .expect("request should deserialize");
+
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+
+        assert!(upstream.get("cache_salt").is_none());
+
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "cache_salt": "tenant-a"
+        }))
+        .expect("request should deserialize");
+
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+
+        assert_eq!(upstream["cache_salt"], "tenant-a");
+    }
+
+    #[test]
+    fn request_payload_omits_absent_and_forwards_present_prompt_cache_key_upstream() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert!(upstream.get("prompt_cache_key").is_none());
+
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "prompt_cache_key": "workspace-a"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert_eq!(upstream["prompt_cache_key"], "workspace-a");
+
+        let null_payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "prompt_cache_key": null
+        }))
+        .expect("null should deserialize as an absent key");
+        let upstream = serde_json::to_value(
+            null_payload
+                .to_upstream_request(false)
+                .expect("request should normalize"),
+        )
+        .expect("upstream request should serialize");
+        assert!(upstream.get("prompt_cache_key").is_none());
+
+        for invalid in [
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!({"tenant": "a"}),
+        ] {
+            let result = serde_json::from_value::<RequestPayload>(serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "prompt_cache_key": invalid
+            }));
+            assert!(result.is_err(), "non-string prompt_cache_key must be rejected");
+        }
+    }
+
+    #[test]
+    fn request_payload_omits_absent_and_forwards_present_service_tier_upstream() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "service_tier": "priority"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert_eq!(upstream["service_tier"], "priority");
+
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "service_tier": null
+        }))
+        .expect("null should deserialize as an absent tier");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert!(upstream.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn request_payload_forwards_reasoning_configuration_upstream() {
+        let reasoning = serde_json::json!({
+            "context": "all_turns",
+            "effort": "high",
+            "generate_summary": "concise",
+            "mode": "pro",
+            "summary": "detailed"
+        });
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "reasoning": reasoning
+        }))
+        .expect("request should deserialize");
+
+        for stream in [false, true] {
+            let upstream = serde_json::to_value(payload.to_upstream_request(stream).expect("request should normalize"))
+                .expect("upstream request should serialize");
+
+            assert_eq!(upstream["reasoning"], reasoning);
+            assert_eq!(upstream["stream"], stream);
+        }
+    }
+
+    #[test]
+    fn request_payload_forwards_text_configuration_upstream() {
+        let text = serde_json::json!({
+            "format": {
+                "type": "json_schema",
+                "name": "weather",
+                "description": "A weather report",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "temperature": {"type": "number"}
+                    },
+                    "required": ["city", "temperature"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            },
+            "verbosity": "low"
+        });
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "text": text
+        }))
+        .expect("request should deserialize");
+
+        for stream in [false, true] {
+            let upstream = serde_json::to_value(payload.to_upstream_request(stream).expect("request should normalize"))
+                .expect("upstream request should serialize");
+
+            assert_eq!(upstream["text"], text);
+            assert_eq!(upstream["stream"], stream);
+        }
+    }
+
+    #[test]
+    fn request_payload_handles_text_configuration_boundaries() {
+        for text in [
+            serde_json::json!({}),
+            serde_json::json!({"format": {"type": "text"}}),
+            serde_json::json!({"format": {"type": "json_object"}}),
+            serde_json::json!({"verbosity": "medium"}),
+            serde_json::json!({
+                "format": {"type": "text", "x-format-extension": true},
+                "x-text-extension": {"enabled": true}
+            }),
+        ] {
+            let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "text": text
+            }))
+            .expect("valid text configuration should deserialize");
+            let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+                .expect("upstream request should serialize");
+
+            assert_eq!(upstream["text"], text);
+        }
+
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "text": null
+        }))
+        .expect("null text configuration should remain absent");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert!(upstream.get("text").is_none());
+
+        for text in [
+            serde_json::json!("json_object"),
+            serde_json::json!({"format": "json_object"}),
+            serde_json::json!({"format": {"type": 7}}),
+            serde_json::json!({"format": {"type": "unknown"}}),
+            serde_json::json!({"format": {"type": "json_schema", "schema": {}}}),
+            serde_json::json!({"format": {"type": "json_schema", "name": "missing_schema"}}),
+            serde_json::json!({"format": {"type": "json_schema", "schema": []}}),
+            serde_json::json!({"verbosity": 1}),
+        ] {
+            let parsed = serde_json::from_value::<RequestPayload>(serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "text": text
+            }));
+
+            assert!(parsed.is_err(), "malformed text configuration should fail: {text}");
+        }
+    }
+
+    #[test]
+    fn text_configuration_preserves_extension_field_order() {
+        let config: ResponseTextConfig = serde_json::from_str(
+            r#"{
+                "format": {
+                    "type": "json_schema",
+                    "name": "ordered",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "second": {"type": "string"},
+                            "first": {"type": "number"}
+                        }
+                    },
+                    "x-format-first": 1,
+                    "x-format-second": 2,
+                    "x-format-third": 3,
+                    "x-format-fourth": 4,
+                    "x-format-fifth": 5,
+                    "x-format-sixth": 6
+                },
+                "verbosity": "low",
+                "x-text-first": 1,
+                "x-text-second": 2,
+                "x-text-third": 3,
+                "x-text-fourth": 4,
+                "x-text-fifth": 5,
+                "x-text-sixth": 6
+            }"#,
+        )
+        .expect("text configuration should deserialize");
+
+        let serialized = serde_json::to_string(&config).expect("text configuration should serialize");
+
+        assert_eq!(
+            serialized,
+            r#"{"format":{"type":"json_schema","name":"ordered","schema":{"type":"object","properties":{"second":{"type":"string"},"first":{"type":"number"}}},"x-format-first":1,"x-format-second":2,"x-format-third":3,"x-format-fourth":4,"x-format-fifth":5,"x-format-sixth":6},"verbosity":"low","x-text-first":1,"x-text-second":2,"x-text-third":3,"x-text-fourth":4,"x-text-fifth":5,"x-text-sixth":6}"#
+        );
+    }
+
+    #[test]
+    fn request_payload_handles_reasoning_boundaries() {
+        for reasoning in [serde_json::json!({}), serde_json::json!({"effort": "minimal"})] {
+            let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "reasoning": reasoning
+            }))
+            .expect("valid reasoning object should deserialize");
+            let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+                .expect("upstream request should serialize");
+
+            assert_eq!(upstream["reasoning"], reasoning);
+        }
+
+        for reasoning in [
+            serde_json::Value::Null,
+            serde_json::json!("high"),
+            serde_json::json!({"effort": 3}),
+        ] {
+            let parsed = serde_json::from_value::<RequestPayload>(serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "reasoning": reasoning
+            }));
+
+            if reasoning.is_null() {
+                let upstream = serde_json::to_value(
+                    parsed
+                        .expect("null should be treated as absent")
+                        .to_upstream_request(false)
+                        .expect("request should normalize"),
+                )
+                .expect("upstream request should serialize");
+                assert!(upstream.get("reasoning").is_none());
+            } else {
+                assert!(parsed.is_err(), "non-object reasoning configuration should be rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn request_payload_uses_option_tool_choice_for_missing_vs_explicit() {
+        let absent: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi"
+        }))
+        .unwrap();
+        assert_eq!(absent.tool_choice, None);
+
+        let explicit: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tool_choice": "none"
+        }))
+        .unwrap();
+        assert_eq!(explicit.tool_choice, Some(ToolChoice::None));
+    }
+
+    /// The model's view of a history call to `weather` in namespace `weather`, after a hosted search that loaded
+    /// `loaded`, in a request that declares no tools (as a compaction summary does).
+    fn undeclared_self_named_call(loaded: Option<Value>) -> Value {
+        self_named_call(loaded, None)
+    }
+
+    /// The model's view of that call in a request declaring `tools`.
+    fn self_named_call(loaded: Option<Value>, tools: Option<&Value>) -> Value {
+        let mut input = vec![serde_json::json!({"type": "message", "role": "user", "content": "weather?"})];
+        if let Some(loaded) = loaded {
+            input.extend([
+                serde_json::json!({"type": "tool_search_call", "id": "tsc_1", "call_id": null, "execution": "server",
+                    "arguments": {"paths": ["weather"]}, "status": "completed"}),
+                serde_json::json!({"type": "tool_search_output", "id": "tso_1", "call_id": null,
+                    "execution": "server", "status": "completed", "tools": [loaded]}),
+            ]);
+        }
+        input.extend([
+            serde_json::json!({"type": "function_call", "call_id": "call_w", "name": "weather",
+                "namespace": "weather", "arguments": "{}", "status": "completed"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "call_w", "output": "18C"}),
+        ]);
+        let payload: RequestPayload =
+            serde_json::from_value(serde_json::json!({"model": "test", "input": input, "tools": tools}))
+                .expect("request");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("upstream")).expect("JSON");
+        upstream["input"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["call_id"] == "call_w" && item["type"] == "function_call")
+            .expect("the weather call")
+            .clone()
+    }
+
+    #[test]
+    fn a_searched_top_level_function_call_is_unqualified_without_declarations() {
+        let function = serde_json::json!({"type": "function", "name": "weather", "parameters": {"type": "object"}});
+
+        let call = undeclared_self_named_call(Some(function));
+
+        assert_eq!(call["name"], "weather");
+        assert!(call.get("namespace").is_none(), "{call}");
+    }
+
+    #[test]
+    fn a_namespace_member_named_like_its_namespace_keeps_the_namespace_without_declarations() {
+        let namespace = serde_json::json!({"type": "namespace", "name": "weather", "description": "Weather tools",
+            "tools": [{"type": "function", "name": "weather", "parameters": {"type": "object"}}]});
+
+        // Neither a search output that loaded the namespace nor a history with no search says the call was to a
+        // searched function, so it stays the namespace member it was.
+        for loaded in [Some(namespace), None] {
+            let call = undeclared_self_named_call(loaded);
+
+            assert_eq!(call["name"], "weather");
+            assert_eq!(call["namespace"], "weather", "{call}");
+        }
+    }
+
+    #[test]
+    fn a_declared_top_level_function_call_is_unqualified_without_its_search_output() {
+        // A compaction can carry a searched function's call past the search output that loaded it; the request still
+        // declares the function.
+        let tools = serde_json::json!([{"type": "function", "name": "weather", "parameters": {"type": "object"}}]);
+
+        let call = self_named_call(None, Some(&tools));
+
+        assert_eq!(call["name"], "weather");
+        assert!(call.get("namespace").is_none(), "{call}");
+    }
+
+    #[test]
+    fn to_upstream_request_carries_instructions_forward() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "instructions": "rules",
+            "input": "hi"
+        }))
+        .unwrap();
+
+        assert_eq!(payload.instructions.as_deref(), Some("rules"));
+        assert!(matches!(&payload.input, ResponsesInput::Text(text) if text == "hi"));
+
+        let upstream = payload.to_upstream_request(false).expect("valid upstream request");
+        let value = serde_json::to_value(upstream).unwrap();
+        assert_eq!(value["instructions"], "rules");
+        assert_eq!(value["input"], "hi");
+    }
+
+    #[test]
+    fn to_upstream_request_preserves_parallel_tool_calls() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "parallel_tool_calls": false
+        }))
+        .unwrap();
+
+        let upstream = payload.to_upstream_request(false).expect("valid upstream request");
+        let value = serde_json::to_value(upstream).unwrap();
+        assert_eq!(value["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn to_upstream_request_allows_parallel_tool_calls_for_client_function_tools() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "parallel_tool_calls": true,
+            "tools": [{"type": "function", "name": "get_weather"}]
+        }))
+        .unwrap();
+
+        let upstream = payload
+            .to_upstream_request(false)
+            .expect("function tools allow parallel calls");
+        let value = serde_json::to_value(upstream).unwrap();
+        assert_eq!(value["parallel_tool_calls"], true);
+    }
+
+    #[test]
+    fn to_upstream_request_preserves_parallel_tool_calls_for_mixed_tools() {
+        for built_in_tool in builtin_tool_declarations() {
+            for parallel_tool_calls in [false, true] {
+                let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+                    "model": "test",
+                    "input": "hi",
+                    "parallel_tool_calls": parallel_tool_calls,
+                    "tools": [
+                        {"type": "function", "name": "get_weather"},
+                        built_in_tool.clone()
+                    ]
+                }))
+                .unwrap();
+
+                let value = serde_json::to_value(
+                    payload
+                        .to_upstream_request(false)
+                        .expect("mixed tools preserve the client's parallel_tool_calls value"),
+                )
+                .unwrap();
+                assert_eq!(value["parallel_tool_calls"], parallel_tool_calls);
+            }
+        }
+    }
+
+    #[test]
+    fn to_upstream_request_defaults_parallel_tool_calls_to_false_when_omitted() {
+        for tool in builtin_tool_declarations() {
+            let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+                "model": "test",
+                "input": "hi",
+                "tools": [tool]
+            }))
+            .unwrap();
+
+            let upstream = payload
+                .to_upstream_request(false)
+                .expect("omitted parallel_tool_calls defaults to false");
+            let value = serde_json::to_value(upstream).unwrap();
+            assert_eq!(value["parallel_tool_calls"], false);
+        }
+    }
+
+    #[test]
+    fn to_upstream_request_allows_parallel_tool_calls_for_builtin_tools() {
+        for tool in builtin_tool_declarations() {
+            let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+                "model": "test",
+                "input": "hi",
+                "parallel_tool_calls": true,
+                "tools": [tool]
+            }))
+            .unwrap();
+
+            let upstream = payload
+                .to_upstream_request(false)
+                .expect("built-in tools allow parallel calls");
+            let value = serde_json::to_value(upstream).unwrap();
+            assert_eq!(value["parallel_tool_calls"], true);
+        }
+    }
+
+    #[test]
+    fn to_upstream_request_allows_builtin_tools_with_serial_tool_calls() {
+        for tool in builtin_tool_declarations() {
+            let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+                "model": "test",
+                "input": "hi",
+                "parallel_tool_calls": false,
+                "tools": [tool]
+            }))
+            .unwrap();
+
+            let upstream = payload
+                .to_upstream_request(false)
+                .expect("serial built-in tool request is valid");
+            let value = serde_json::to_value(upstream).unwrap();
+            assert_eq!(value["parallel_tool_calls"], false);
+        }
+    }
+
+    fn builtin_tool_declarations() -> Vec<Value> {
+        vec![
+            serde_json::json!({
+                "type": "mcp",
+                "server_label": "repo",
+                "server_url": "http://localhost:9001/mcp"
+            }),
+            serde_json::json!({"type": "web_search_preview"}),
+            serde_json::json!({"type": "file_search", "vector_store_ids": ["vs_abc"]}),
+            serde_json::json!({"type": "code_interpreter", "container": {"type": "auto"}}),
+        ]
+    }
+
+    #[test]
+    fn to_upstream_request_flattens_namespace_and_skips_unknown_tools() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp__shell",
+                    "tools": [
+                        {"type": "function", "name": "run", "parameters": {"type": "object"}},
+                        {"type": "future_member", "opaque": true}
+                    ]
+                },
+                {"type": "future_tool", "opaque": true}
+            ]
+        }))
+        .unwrap();
+
+        let tools = payload.tools.as_ref().expect("tools should preserve explicit presence");
+        assert_eq!(tools.len(), 2);
+        let ResponsesTool::Namespace(namespace) = &tools[0] else {
+            panic!("expected namespace tool");
+        };
+        assert_eq!(namespace.tools.len(), 2);
+
+        let upstream = payload.to_upstream_request(false).expect("valid upstream request");
+        let value = serde_json::to_value(upstream).unwrap();
+        assert_eq!(value["tools"].as_array().expect("upstream tools").len(), 1);
+        assert_eq!(value["tools"][0]["name"], "agentic_ns__mcp__shell__run");
+    }
+
+    #[test]
+    fn to_upstream_request_rejects_namespace_collisions() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "agentic_ns__mcp__shell__run"},
+                {
+                    "type": "namespace",
+                    "name": "mcp__shell",
+                    "tools": [{"type": "function", "name": "run"}]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let Err(err) = payload.to_upstream_request(false) else {
+            panic!("colliding namespace member should be rejected");
+        };
+
+        assert!(err.to_string().contains("collides with a declared function tool"));
+    }
+
+    #[test]
+    fn to_upstream_request_normalizes_custom_tools_to_functions() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tool_choice": {
+                "type": "custom",
+                "name": "apply_patch"
+            },
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object"}
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch.",
+                    "x-provider-field": {"mode": "strict"}
+                }
+            ]
+        }))
+        .unwrap();
+
+        let request = payload.to_upstream_request(false).unwrap();
+        let tools = request.tools.as_ref().expect("mixed upstream tools");
+        let UpstreamTool::Function(first) = &tools[0];
+        let UpstreamTool::Function(second) = &tools[1];
+        assert_eq!(first.name, "read_file");
+        assert_eq!(second.name, "apply_patch");
+
+        let upstream = serde_json::to_value(request).unwrap();
+        assert_eq!(upstream["tools"][0]["type"], "function");
+        assert_eq!(upstream["tools"][0]["name"], "read_file");
+        assert_eq!(upstream["tools"][1]["type"], "function");
+        assert_eq!(upstream["tools"][1]["name"], "apply_patch");
+        let custom_description = upstream["tools"][1]["description"]
+            .as_str()
+            .expect("custom tool description");
+        assert!(custom_description.contains("Apply a patch."));
+        assert!(custom_description.contains("raw tool input in the `input` string field"));
+        assert!(custom_description.contains("x-provider-field"));
+        assert_eq!(
+            upstream["tools"][1]["parameters"]["properties"]["input"]["type"],
+            "string"
+        );
+        assert_eq!(upstream["tools"][1]["parameters"]["required"][0], "input");
+        assert_eq!(upstream["tool_choice"]["type"], "function");
+        assert_eq!(upstream["tool_choice"]["name"], "apply_patch");
+
+        let deserialized: FunctionTool =
+            serde_json::from_value(upstream["tools"][1].clone()).expect("upstream function tool should deserialize");
+        assert_eq!(deserialized.name, "apply_patch");
+    }
+
+    #[test]
+    fn to_upstream_request_rejects_custom_tool_grammar_formats() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tools": [{
+                "type": "custom",
+                "name": "constrained_input",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: value"
+                }
+            }]
+        }))
+        .expect("request");
+
+        let error = payload
+            .to_upstream_request(false)
+            .expect_err("unsupported grammar must fail closed");
+        assert!(error.to_string().contains("cannot preserve constrained decoding"));
+    }
+
+    #[test]
+    fn to_upstream_request_normalizes_custom_allowed_tool_choices() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [
+                    {"type": "function", "name": "read_file"},
+                    {"type": "custom", "name": "apply_patch"}
+                ]
+            },
+            "tools": [
+                {"type": "function", "name": "read_file"},
+                {"type": "custom", "name": "apply_patch"}
+            ]
+        }))
+        .unwrap();
+
+        let public_choice = serde_json::to_value(payload.tool_choice.as_ref().unwrap()).unwrap();
+        assert_eq!(public_choice["tools"][1]["type"], "custom");
+
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).unwrap()).unwrap();
+        assert_eq!(upstream["tool_choice"]["type"], "allowed_tools");
+        assert_eq!(upstream["tool_choice"]["mode"], "required");
+        assert_eq!(upstream["tool_choice"]["tools"][0]["type"], "function");
+        assert_eq!(upstream["tool_choice"]["tools"][1]["type"], "function");
+        assert_eq!(upstream["tool_choice"]["tools"][1]["name"], "apply_patch");
+    }
+
+    #[test]
+    fn to_upstream_request_rejects_custom_choice_for_function_declaration() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tool_choice": {"type": "custom", "name": "echo"},
+            "tools": [{"type": "function", "name": "echo"}]
+        }))
+        .expect("request");
+
+        let error = payload
+            .to_upstream_request(false)
+            .expect_err("a custom selector must match a custom declaration");
+        assert!(error.to_string().contains("no matching custom tool is declared"));
+    }
+
+    #[test]
+    fn to_upstream_request_rejects_unknown_custom_allowed_tool() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "custom", "name": "missing"}]
+            },
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }))
+        .expect("request");
+
+        let error = payload
+            .to_upstream_request(false)
+            .expect_err("an allowed custom selector must match a custom declaration");
+        assert!(error.to_string().contains("no matching custom tool is declared"));
+    }
+
+    #[test]
+    fn legacy_unknown_items_are_omitted_from_model_conversion() {
+        let mut items: Vec<InOutItem> = serde_json::from_value(serde_json::json!([
+            {"type": "message", "role": "user", "content": "hi"}
+        ]))
+        .unwrap();
+        items.push(InOutItem::Output(OutputItem::Unknown));
+        let input = ResponsesInput::from(items);
+
+        let items = Vec::<InputItem>::from(&input);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], InputItem::Message(_)));
+    }
+
+    #[test]
+    fn responses_input_rejects_unknown_items() {
+        let input = serde_json::from_value::<ResponsesInput>(serde_json::json!([
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "future_item", "payload": {"a": 1}}
+        ]));
+        assert!(input.is_err(), "an unmodeled item type fails at the boundary");
+    }
+
+    #[test]
+    fn response_payload_terminal_chunk_uses_status_specific_event_type() {
+        let mut payload = ResponsePayload {
+            id: "resp_test".to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            model: "test-model".to_string(),
+            status: "completed".to_string(),
+            output: Vec::new(),
+            usage: None,
+            incomplete_details: None,
+            error: None,
+            previous_response_id: None,
+            conversation: None,
+            instructions: None,
+            max_tool_calls: None,
+            service_tier: None,
+            tools: None,
+            tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
+        };
+
+        for (status, expected_type) in [
+            ("completed", "response.completed"),
+            ("incomplete", "response.incomplete"),
+            ("failed", "response.failed"),
+            ("error", "response.failed"),
+            ("in_progress", "response.in_progress"),
+        ] {
+            payload.status = status.to_string();
+            let chunk = payload.as_terminal_response_chunk();
+            let data = chunk.trim().strip_prefix("data: ").unwrap();
+            let event: Value = serde_json::from_str(data).unwrap();
+            assert_eq!(event["type"], expected_type);
+            assert_eq!(event["response"]["status"], status);
+        }
+    }
+
+    #[test]
+    fn response_payload_echoes_openai_code_interpreter_declaration() {
+        let declaration = serde_json::json!({"type": "code_interpreter", "container": {"type": "auto"}});
+        let tool = serde_json::from_value(declaration.clone()).expect("OpenAI tool declaration");
+        let payload = ResponsePayload {
+            id: "resp_test".to_owned(),
+            object: "response".to_owned(),
+            created_at: 0,
+            model: "test-model".to_owned(),
+            status: "completed".to_owned(),
+            output: Vec::new(),
+            usage: None,
+            incomplete_details: None,
+            error: None,
+            previous_response_id: None,
+            conversation: None,
+            instructions: None,
+            max_tool_calls: None,
+            service_tier: None,
+            tools: Some(vec![tool]),
+            tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
+        };
+
+        let response = serde_json::to_value(&payload).expect("blocking response");
+        assert_eq!(response["tools"], serde_json::json!([declaration]));
+        let chunk = payload.as_created_response_chunk();
+        let event: Value =
+            serde_json::from_str(chunk.trim().strip_prefix("data: ").unwrap()).expect("created streaming event");
+        assert_eq!(event["response"]["tools"], response["tools"]);
+        assert!(response["tools"][0].get("execution").is_none());
+    }
+
+    #[test]
+    fn response_payload_created_chunk_uses_in_progress_status() {
+        let payload = ResponsePayload {
+            id: "resp_test".to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            model: "test-model".to_string(),
+            status: "completed".to_string(),
+            output: Vec::new(),
+            usage: None,
+            incomplete_details: None,
+            error: None,
+            previous_response_id: None,
+            conversation: None,
+            instructions: None,
+            max_tool_calls: None,
+            service_tier: None,
+            tools: None,
+            tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
+        };
+
+        let chunk = payload.as_created_response_chunk();
+        let data = chunk.trim().strip_prefix("data: ").unwrap();
+        let event: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(event["type"], "response.created");
+        assert_eq!(event["response"]["id"], "resp_test");
+        assert_eq!(event["response"]["status"], "in_progress");
+    }
+}

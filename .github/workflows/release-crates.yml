@@ -1,0 +1,249 @@
+name: Release crates
+
+run-name: Release crates (${{ inputs.dry_run && 'dry run' || 'publish' }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run packaging and publish checks without uploading crates"
+        required: true
+        type: boolean
+        default: true
+      version:
+        description: "Version already merged into main, such as 0.3.0"
+        required: true
+        type: string
+
+concurrency:
+  group: release-crates
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release crates.io packages
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Verify maintainer permission
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          permission="$(gh api \
+            "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" \
+            --jq '.role_name')"
+
+          case "$permission" in
+            admin|maintain)
+              echo "$GITHUB_ACTOR has $permission permission"
+              ;;
+            *)
+              echo "::error::$GITHUB_ACTOR has $permission permission"
+              echo "::error::Crates releases require admin or maintain permission"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.1
+          components: clippy, rustfmt
+
+      - name: Read and verify package versions
+        id: version
+        run: |
+          set -euo pipefail
+          requested_version="${{ inputs.version }}"
+          core_version="$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "agentic-server-core") | .version')"
+          server_version="$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "agentic-server") | .version')"
+
+          if [ -z "$core_version" ] || [ "$core_version" = "null" ]; then
+            echo "::error::agentic-server-core package not found in workspace metadata"
+            exit 1
+          fi
+
+          if [ "$core_version" != "$server_version" ]; then
+            echo "::error::agentic-server-core ($core_version) and agentic-server ($server_version) versions differ"
+            exit 1
+          fi
+
+          if [ "$core_version" != "$requested_version" ]; then
+            echo "::error::package version $core_version does not match requested release version $requested_version"
+            exit 1
+          fi
+
+          echo "Release version: $core_version"
+          echo "version=$core_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$core_version" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release commit
+        id: target
+        run: |
+          set -euo pipefail
+          target_sha="$(git rev-parse HEAD)"
+
+          echo "sha=$target_sha" >> "$GITHUB_OUTPUT"
+          echo "Release target: $target_sha"
+
+      - name: Check release refs
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          target_sha="${{ steps.target.outputs.sha }}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          fi
+
+      - name: Check published versions
+        env:
+          AGENTIC_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for crate in agentic-server-core agentic-server; do
+            status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --user-agent 'agentic-api-release (https://github.com/vllm-project/agentic-api)' \
+              --connect-timeout 10 --max-time 30 \
+              "https://crates.io/api/v1/crates/$crate/$AGENTIC_RELEASE_VERSION")"
+            case "$status" in
+              404) echo "$crate $AGENTIC_RELEASE_VERSION is not published" ;;
+              200)
+                echo "::error::$crate $AGENTIC_RELEASE_VERSION is already published; bump the Cargo workspace version"
+                exit 1
+                ;;
+              *)
+                echo "::error::Unable to check crates.io release availability for $crate (HTTP $status)"
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Verify lockfile
+        run: cargo check --workspace --locked
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-
+            cargo-${{ runner.os }}-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Dry-run package publication
+        if: inputs.dry_run
+        run: |
+          set -euo pipefail
+          cargo publish --dry-run --locked -p agentic-server-core
+          cargo package --no-verify --locked -p agentic-server \
+            --config 'patch.crates-io.agentic-server-core.path="crates/agentic-server-core"'
+          echo "Would release commit ${{ steps.target.outputs.sha }}"
+          echo "Would create tag ${{ steps.version.outputs.tag }}"
+          echo "Would create GitHub release ${{ steps.version.outputs.tag }} with generated notes"
+
+      - name: Publish agentic-server-core
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p agentic-server-core
+
+      - name: Wait for agentic-server-core index
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+
+          for attempt in {1..30}; do
+            if cargo info "agentic-server-core@$version" >/dev/null 2>&1; then
+              echo "agentic-server-core $version is available in crates.io index"
+              exit 0
+            fi
+
+            echo "Waiting for crates.io index to expose agentic-server-core $version (attempt $attempt/30)"
+            sleep 10
+          done
+
+          echo "::error::agentic-server-core $version was not visible in crates.io index in time"
+          exit 1
+
+      - name: Publish agentic-server
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p agentic-server
+
+      - name: Create release refs
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          target_sha="${{ steps.target.outputs.sha }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$tag" "$target_sha" -m "$tag"
+          git push origin "$tag"
+
+      - name: Create GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          target_sha="${{ steps.target.outputs.sha }}"
+          gh release create "$tag" \
+            --target "$target_sha" \
+            --title "$tag" \
+            --generate-notes
+
+  container:
+    name: Publish release container
+    needs: release
+    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/release-container.yml
+    with:
+      source_ref: ${{ needs.release.outputs.tag }}
+      image_tag: ${{ needs.release.outputs.tag }}
+      release_build: true
+    secrets: inherit
+
+  website:
+    name: Refresh and deploy website
+    needs: release
+    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # GITHUB_TOKEN-created releases do not trigger another release event workflow.
+    uses: ./.github/workflows/website.yml

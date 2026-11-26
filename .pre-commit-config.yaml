@@ -1,0 +1,62 @@
+exclude: 'build/|target/'
+minimum_pre_commit_version: 4.4.0
+default_language_version:
+    python: python3.12
+
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    -   id: check-merge-conflict
+        args: ['--assume-in-merge']
+    -   id: trailing-whitespace
+    -   id: check-added-large-files
+        args: ['--maxkb=1000']
+        exclude_types: [yaml]
+    -   id: end-of-file-fixer
+        exclude: '^(.*\.svg|.*\.md)$'
+    -   id: no-commit-to-branch
+    -   id: check-yaml
+        args: ["--unsafe"]
+    -   id: detect-private-key
+    -   id: mixed-line-ending
+        args: [--fix=lf]
+    -   id: check-executables-have-shebangs
+    -   id: check-json
+    -   id: check-shebang-scripts-are-executable
+    -   id: check-symlinks
+    -   id: check-toml
+
+-   repo: local
+    hooks:
+    -   id: rust-file-sizes
+        name: Rust production file sizes
+        language: python
+        entry: python scripts/check_rust_file_sizes.py
+        additional_dependencies: &rust_size_dependencies
+        - tree-sitter==0.25.2
+        - tree-sitter-rust==0.24.2
+        pass_filenames: false
+        always_run: true
+    -   id: rust-file-size-tests
+        name: Rust file-size checker tests
+        language: python
+        entry: python -m unittest discover -s scripts/tests -p test_rust_file_sizes.py
+        additional_dependencies: *rust_size_dependencies
+        files: '^(scripts/(check_rust_file_sizes.py|tests/test_rust_file_sizes.py)|\.rust-file-sizes.json|\.pre-commit-config.yaml)$'
+        pass_filenames: false
+    -   id: rustfmt
+        name: rustfmt
+        language: system
+        entry: cargo fmt -- --check
+        types: [rust]
+        pass_filenames: false
+
+ci:
+    skip: [rustfmt]
+    autofix_commit_msg: '[pre-commit.ci] Auto format from pre-commit.com hooks'
+    autoupdate_commit_msg: '[pre-commit.ci] pre-commit autoupdate'
+    autofix_prs: true
+    autoupdate_branch: ''
+    autoupdate_schedule: weekly
+    submodules: false

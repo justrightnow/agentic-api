@@ -1,0 +1,1062 @@
+//! Compare recorded API histories and replay them through the current gateway.
+//! Set `REQUIRE_CONVERSATIONS_CASSETTES=1` in CI to require both recordings.
+
+mod support;
+
+use agentic_core::types::conversations::ConversationMetadata;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::path::PathBuf;
+use support::replay::{IdPairs, compare_value, remap_error_message};
+
+#[derive(Debug, Deserialize)]
+struct Cassette {
+    turns: Vec<Turn>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Turn {
+    filename: String,
+    request: Request,
+    response: RecordedResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct Request {
+    method: String,
+    path: String,
+    #[serde(default)]
+    query_params: Value,
+    #[serde(default)]
+    body: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordedResponse {
+    status_code: u16,
+    #[serde(default)]
+    body: Option<Value>,
+    #[serde(default)]
+    sse: Option<Vec<String>>,
+}
+
+fn cassette(name: &str, provider: &str) -> Option<Cassette> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/cassettes/conversations")
+        .join(format!("conversations-{name}-{provider}.yaml"));
+    if !path.exists() {
+        return None;
+    }
+    Some(
+        serde_yaml::from_str(&std::fs::read_to_string(&path).expect("read cassette"))
+            .expect("parse flat recorder-generated cassette"),
+    )
+}
+
+fn pair(name: &str) -> Option<(Cassette, Cassette)> {
+    let openai = cassette(name, "openai");
+    let gateway = cassette(name, "gateway");
+    if openai.is_none() && gateway.is_none() && std::env::var_os("REQUIRE_CONVERSATIONS_CASSETTES").is_none() {
+        eprintln!("{name}: recordings unavailable; run record_conversations_api_cassettes.sh");
+        return None;
+    }
+    Some((
+        openai.expect("missing OpenAI cassette"),
+        gateway.expect("missing gateway cassette"),
+    ))
+}
+
+fn compare_path(a: &str, b: &str, ids: &mut IdPairs) {
+    let left: Vec<_> = a.split('/').collect();
+    let right: Vec<_> = b.split('/').collect();
+    assert_eq!(left.len(), right.len(), "request path depth differs");
+    for (index, (l, r)) in left.iter().zip(right).enumerate() {
+        if index == 3 || index == 5 {
+            ids.compare(l, r, "request path");
+        } else {
+            assert_eq!(*l, r, "request path differs");
+        }
+    }
+}
+
+fn sse_events(response: &RecordedResponse) -> Vec<Value> {
+    let mut events = Vec::new();
+    for line in response.sse.as_ref().expect("streaming response has no SSE capture") {
+        if let Some(data) = line.trim().strip_prefix("data: ")
+            && data != "[DONE]"
+        {
+            events.push(serde_json::from_str(data).expect("valid SSE JSON"));
+        }
+    }
+    assert!(!events.is_empty(), "empty SSE recording");
+    events
+}
+
+fn assert_sse_conversation_shapes(response: &RecordedResponse, has_conversation: bool, location: &str) {
+    let events = sse_events(response);
+    for (i, event) in events.iter().enumerate() {
+        let event_type = event["type"].as_str().unwrap_or_default();
+        // Check all events that carry a response object
+        if event_type.starts_with("response.") && event.get("response").is_some() {
+            let event_location = format!("{location} SSE event {i} ({event_type})");
+            assert_conversation_object_shape(&event["response"], has_conversation, &event_location);
+        }
+    }
+}
+
+fn result_body(response: &RecordedResponse) -> Value {
+    if response.sse.is_some() {
+        let events = sse_events(response);
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("response.completed" | "response.failed" | "response.incomplete")
+                )
+            })
+            .expect("SSE has no terminal event");
+        terminal["response"].clone()
+    } else {
+        response.body.clone().expect("response body missing")
+    }
+}
+
+fn lifecycle(response: &RecordedResponse) -> Vec<String> {
+    sse_events(response)
+        .iter()
+        .filter(|event| {
+            let kind = event["type"].as_str().unwrap_or_default();
+            let is_delta = kind.split('.').next_back() == Some("delta");
+            let is_reasoning_item = kind.starts_with("response.output_item.") && event["item"]["type"] == "reasoning";
+            !(is_delta || kind.starts_with("response.reasoning_") || is_reasoning_item)
+        })
+        .filter_map(|event| event["type"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn item_shape(item: &Value) -> Value {
+    let content = item["content"]
+        .as_array()
+        .expect("message content array")
+        .iter()
+        .map(|part| {
+            let text = if part["type"] == "output_text" {
+                Value::String("<generated>".to_owned())
+            } else {
+                part["text"].clone()
+            };
+            json!({"type": part["type"], "text": text})
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": item["id"],
+        "type": item["type"],
+        "role": item["role"],
+        "status": item["status"],
+        "content": content,
+    })
+}
+
+fn list_shape(body: &Value) -> Value {
+    let data = body["data"]
+        .as_array()
+        .expect("item list data")
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .map(item_shape)
+        .collect::<Vec<_>>();
+    let first_id = data.first().map(|item| item["id"].clone());
+    let last_id = data.last().map(|item| item["id"].clone());
+    json!({
+        "object": body["object"],
+        "data": data,
+        "first_id": first_id,
+        "last_id": last_id,
+        "has_more": body["has_more"],
+    })
+}
+
+fn assert_conversation_object_shape(body: &Value, has_conversation: bool, location: &str) {
+    if !has_conversation {
+        assert!(
+            body.get("conversation").is_none(),
+            "{location}: a previous-response branch must not return conversation"
+        );
+    }
+    // Assert conversation is an object with id field, never a string
+    if !body["conversation"].is_null() {
+        assert!(
+            body["conversation"].is_object(),
+            "{location}: conversation must be object, got {}",
+            body["conversation"]
+        );
+        assert!(
+            body["conversation"]["id"].is_string(),
+            "{location}: conversation.id must be string, got {}",
+            body["conversation"]["id"]
+        );
+    }
+    // Assert conversation_id is not present (deprecated field)
+    assert!(
+        body.get("conversation_id").is_none(),
+        "{location}: conversation_id must not be present, found {}",
+        body["conversation_id"]
+    );
+}
+
+fn response_shape(body: &Value, has_conversation: bool) -> Value {
+    let outputs = body["output"]
+        .as_array()
+        .expect("response output")
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .map(item_shape)
+        .collect::<Vec<_>>();
+    let mut result = json!({
+        "id": body["id"],
+        "object": body["object"],
+        "status": body["status"],
+        "previous_response_id": body["previous_response_id"],
+        "output": outputs,
+    });
+    if has_conversation {
+        result["conversation"] = body["conversation"].clone();
+    }
+    result
+}
+
+fn comparable_body(turn: &Turn) -> Value {
+    let body = result_body(&turn.response);
+    if turn.request.path == "/v1/responses" && turn.response.status_code == 200 {
+        let has_conversation =
+            turn.request.body.get("conversation").is_some() || turn.request.body.get("conversation_id").is_some();
+        return response_shape(&body, has_conversation);
+    }
+    if turn.request.path.ends_with("items") && turn.response.status_code == 200 {
+        return list_shape(&body);
+    }
+    if turn.request.path.contains("/items/") && turn.request.method == "GET" && turn.response.status_code == 200 {
+        return item_shape(&body);
+    }
+    body
+}
+
+fn compare_recordings(name: &str, openai: &Cassette, gateway: &Cassette) {
+    assert_eq!(openai.turns.len(), gateway.turns.len(), "{name}: comparable step count");
+    let mut ids = IdPairs::default();
+    for (i, (a, b)) in openai.turns.iter().zip(&gateway.turns).enumerate() {
+        // vLLM may record reasoning items that OpenAI does not expose. Page
+        // boundaries therefore differ; each provider's pages are checked
+        // against its own full ordered list below.
+        if name.starts_with("pagination") && i >= 4 {
+            continue;
+        }
+        let location = format!("{name} turn {}", i + 1);
+        assert_eq!(a.request.method, b.request.method, "{location}: method");
+        compare_path(&a.request.path, &b.request.path, &mut ids);
+        compare_value(
+            &a.request.query_params,
+            &b.request.query_params,
+            &location,
+            &mut ids,
+            false,
+        );
+        compare_value(&a.request.body, &b.request.body, &location, &mut ids, false);
+        assert_eq!(a.response.status_code, b.response.status_code, "{location}: status");
+        assert_eq!(
+            a.response.sse.is_some(),
+            b.response.sse.is_some(),
+            "{location}: SSE transport"
+        );
+
+        // Assert conversation object shape in /v1/responses turns
+        if a.request.path == "/v1/responses" && a.response.status_code == 200 {
+            let has_conversation =
+                a.request.body.get("conversation").is_some() || a.request.body.get("conversation_id").is_some();
+            if a.response.sse.is_some() {
+                // Check every response object, including previous-response branches.
+                assert_sse_conversation_shapes(&a.response, has_conversation, &format!("{location} (OpenAI)"));
+                assert_sse_conversation_shapes(&b.response, has_conversation, &format!("{location} (gateway)"));
+            } else {
+                let a_body = a.response.body.as_ref().expect("response body");
+                let b_body = b.response.body.as_ref().expect("response body");
+                assert_conversation_object_shape(a_body, has_conversation, &format!("{location} (OpenAI)"));
+                assert_conversation_object_shape(b_body, has_conversation, &format!("{location} (gateway)"));
+            }
+        }
+
+        if a.response.sse.is_some() {
+            assert_eq!(
+                lifecycle(&a.response),
+                lifecycle(&b.response),
+                "{location}: SSE lifecycle"
+            );
+        }
+        let mut a_body = comparable_body(a);
+        remap_error_message(&mut a_body, &ids);
+        let b_body = comparable_body(b);
+        compare_value(&a_body, &b_body, &location, &mut ids, false);
+    }
+}
+
+fn response_text(turn: &Turn) -> String {
+    let body = result_body(&turn.response);
+    body["output"]
+        .as_array()
+        .expect("response.output array")
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "output_text")
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase()
+}
+
+fn response_turns(cassette: &Cassette) -> Vec<&Turn> {
+    cassette
+        .turns
+        .iter()
+        .filter(|turn| turn.request.path == "/v1/responses")
+        .collect()
+}
+
+fn listed_ids(turn: &Turn) -> Vec<&str> {
+    turn.response.body.as_ref().expect("list body")["data"]
+        .as_array()
+        .expect("list data")
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .map(|item| item["id"].as_str().expect("item ID"))
+        .collect()
+}
+
+fn all_listed_ids(turn: &Turn) -> Vec<&str> {
+    turn.response.body.as_ref().expect("list body")["data"]
+        .as_array()
+        .expect("list data")
+        .iter()
+        .map(|item| item["id"].as_str().expect("item ID"))
+        .collect()
+}
+
+fn assert_answer(turn: &Turn, expected: &str) {
+    let text = response_text(turn);
+    let answer = text.trim().trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    assert_eq!(answer, expected, "unexpected model answer");
+}
+
+fn assert_transport(cassette: &Cassette, streaming: bool) {
+    for turn in response_turns(cassette) {
+        assert_eq!(turn.request.body["stream"], streaming);
+        assert_eq!(turn.response.sse.is_some(), streaming);
+        if streaming {
+            let kinds = lifecycle(&turn.response);
+            assert_eq!(kinds.first().map(String::as_str), Some("response.created"));
+            assert_eq!(kinds.last().map(String::as_str), Some("response.completed"));
+            assert!(kinds.contains(&"response.output_item.added".to_owned()));
+            assert!(kinds.contains(&"response.output_item.done".to_owned()));
+            assert!(
+                !kinds
+                    .iter()
+                    .any(|kind| kind == "response.failed" || kind == "response.incomplete")
+            );
+        }
+    }
+}
+
+fn check_opening(turns: &[Turn]) -> (String, String, String) {
+    assert_eq!(
+        (turns[0].request.method.as_str(), turns[0].request.path.as_str()),
+        ("POST", "/v1/conversations")
+    );
+    let conversation_id = turns[0].response.body.as_ref().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        (turns[1].request.method.as_str(), turns[1].request.path.as_str()),
+        ("POST", "/v1/responses")
+    );
+    assert_eq!(turns[1].request.body["conversation"], conversation_id);
+    assert!(turns[1].request.body.get("previous_response_id").is_none());
+    assert_answer(&turns[1], "SAPPHIRE");
+
+    let items_path = format!("/v1/conversations/{conversation_id}/items");
+    assert_eq!(
+        (turns[2].request.method.as_str(), turns[2].request.path.as_str()),
+        ("POST", items_path.as_str())
+    );
+    let first_manual_id = turns[2].response.body.as_ref().unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        turns[2].response.body.as_ref().unwrap()["data"][0]["content"][0]["text"],
+        "The new secret word is ORCHID."
+    );
+
+    (conversation_id, items_path, first_manual_id)
+}
+
+fn check_steps(cassette: &Cassette, expected: usize, streaming: bool) {
+    assert_eq!(cassette.turns.len(), expected, "API step count");
+    for (index, turn) in cassette.turns.iter().enumerate() {
+        assert_eq!(turn.filename, format!("t{}", index + 1));
+        assert_eq!(turn.response.status_code, 200, "t{} status", index + 1);
+    }
+    assert_transport(cassette, streaming);
+}
+
+fn check_case(cassette: &Cassette, scenario: &str, streaming: bool) {
+    let expected = if scenario == "branch" { 6 } else { 5 };
+    check_steps(cassette, expected, streaming);
+
+    let turns = &cassette.turns;
+    let (conversation_id, items_path, first_manual_id) = check_opening(turns);
+
+    if scenario == "deletion" {
+        assert_eq!(turns[3].request.method, "DELETE");
+        assert_eq!(turns[3].request.path, format!("{items_path}/{first_manual_id}"));
+        let body = turns[3].response.body.as_ref().unwrap();
+        assert_eq!(body["object"], "conversation");
+        assert_eq!(body["id"], conversation_id);
+    } else {
+        assert_eq!(
+            (turns[3].request.method.as_str(), turns[3].request.path.as_str()),
+            ("POST", "/v1/responses")
+        );
+        if scenario == "branch" {
+            let parent_id = result_body(&turns[1].response)["id"].as_str().unwrap().to_owned();
+            assert_eq!(turns[3].request.body["previous_response_id"], parent_id);
+            assert!(turns[3].request.body.get("conversation").is_none());
+            assert_answer(&turns[3], "SAPPHIRE");
+            assert_eq!(
+                (turns[4].request.method.as_str(), turns[4].request.path.as_str()),
+                ("POST", items_path.as_str())
+            );
+            assert_eq!(
+                turns[4].request.body["items"][0]["content"],
+                "The branch marker is VIOLET."
+            );
+        } else {
+            assert_eq!(turns[3].request.body["conversation"], conversation_id);
+            assert!(turns[3].request.body.get("previous_response_id").is_none());
+            assert_answer(&turns[3], "ORCHID");
+        }
+    }
+
+    let listing = turns.last().unwrap();
+    assert_eq!(
+        (listing.request.method.as_str(), listing.request.path.as_str()),
+        ("GET", items_path.as_str())
+    );
+    assert_eq!(listing.request.query_params["order"], "asc");
+    let listed = listed_ids(listing);
+    let first_generated = result_body(&turns[1].response)["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "message")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        listed.contains(&first_generated.as_str()),
+        "first response item missing from conversation"
+    );
+    assert_eq!(listed.contains(&first_manual_id.as_str()), scenario != "deletion");
+    assert_eq!(
+        listed.len(),
+        listed.iter().collect::<std::collections::HashSet<_>>().len()
+    );
+    if scenario != "deletion" {
+        let generated_index = listed.iter().position(|id| *id == first_generated).unwrap();
+        let manual_index = listed.iter().position(|id| *id == first_manual_id.as_str()).unwrap();
+        assert!(generated_index < manual_index, "manual item is out of order");
+    }
+
+    if scenario == "branch" {
+        let second_manual_id = turns[4].response.body.as_ref().unwrap()["data"][0]["id"]
+            .as_str()
+            .unwrap();
+        assert!(listed.contains(&second_manual_id), "second manual item missing");
+        let first_index = listed.iter().position(|id| *id == first_manual_id.as_str()).unwrap();
+        let second_index = listed.iter().position(|id| *id == second_manual_id).unwrap();
+        assert!(first_index < second_index, "manual items are out of order");
+        let branch_output = result_body(&turns[3].response)["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            !listed.contains(&branch_output.as_str()),
+            "response branch leaked into conversation"
+        );
+    } else if scenario == "continuation" {
+        let continuation_output = result_body(&turns[3].response)["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            listed.contains(&continuation_output.as_str()),
+            "conversation continuation output is missing from history"
+        );
+    }
+}
+
+fn check_page_pair(turns: &[Turn], full_index: usize, page_index: usize, order: &str) {
+    let full = all_listed_ids(&turns[full_index]);
+    let first = all_listed_ids(&turns[page_index]);
+    let second = all_listed_ids(&turns[page_index + 1]);
+    assert_eq!(turns[full_index].request.query_params, json!({"order": order}));
+    assert_eq!(
+        turns[page_index].request.query_params,
+        json!({"order": order, "limit": "2"})
+    );
+    assert_eq!(turns[page_index + 1].request.query_params["order"], order);
+    assert_eq!(turns[page_index + 1].request.query_params["limit"], "2");
+    assert_eq!(first.len(), 2);
+    assert!(!second.is_empty() && second.len() <= 2);
+    assert_eq!(turns[page_index + 1].request.query_params["after"], first[1]);
+    assert_eq!(
+        first.iter().chain(second.iter()).copied().collect::<Vec<_>>(),
+        full[..first.len() + second.len()],
+        "{order} page order differs from its provider's full list"
+    );
+    for (turn, ids) in [(&turns[page_index], &first), (&turns[page_index + 1], &second)] {
+        let body = turn.response.body.as_ref().unwrap();
+        assert_eq!(body["first_id"], ids[0]);
+        assert_eq!(body["last_id"], ids[ids.len() - 1]);
+    }
+    assert_eq!(turns[page_index].response.body.as_ref().unwrap()["has_more"], true);
+    assert_eq!(
+        turns[page_index + 1].response.body.as_ref().unwrap()["has_more"],
+        first.len() + second.len() < full.len()
+    );
+}
+
+fn check_pagination(cassette: &Cassette, streaming: bool) {
+    let turns = &cassette.turns;
+    check_steps(cassette, 10, streaming);
+    let (conversation_id, items_path, manual_id) = check_opening(turns);
+    assert_eq!(turns[1].request.body["conversation"], conversation_id);
+    for turn in &turns[3..] {
+        assert_eq!(turn.request.method, "GET");
+        assert_eq!(turn.request.path, items_path);
+    }
+    check_page_pair(turns, 3, 4, "asc");
+    check_page_pair(turns, 6, 7, "desc");
+    let ascending = all_listed_ids(&turns[3]);
+    let descending = all_listed_ids(&turns[6]);
+    assert_eq!(descending, ascending.iter().rev().copied().collect::<Vec<_>>());
+    assert!(ascending.contains(&manual_id.as_str()));
+
+    let included = &turns[9];
+    assert_eq!(
+        included.request.query_params,
+        json!({"order": "asc", "include[]": "message.output_text.logprobs"})
+    );
+    assert_eq!(all_listed_ids(included), ascending);
+    assert_eq!(
+        list_shape(included.response.body.as_ref().unwrap()),
+        list_shape(turns[3].response.body.as_ref().unwrap())
+    );
+}
+
+async fn compare_case(scenario: &str) {
+    for streaming in [false, true] {
+        let name = if streaming {
+            format!("{scenario}-stream")
+        } else {
+            scenario.to_owned()
+        };
+        let Some((openai, gateway)) = pair(&name) else { continue };
+        if scenario == "pagination" {
+            check_pagination(&openai, streaming);
+            check_pagination(&gateway, streaming);
+        } else {
+            check_case(&openai, scenario, streaming);
+            check_case(&gateway, scenario, streaming);
+        }
+        compare_recordings(&name, &openai, &gateway);
+        replay::run(&format!("{name}/openai"), &openai).await;
+        replay::run(&format!("{name}/gateway"), &gateway).await;
+    }
+}
+
+#[tokio::test]
+async fn continuation_matches_openai() {
+    compare_case("continuation").await;
+}
+
+#[tokio::test]
+async fn deletion_matches_openai() {
+    compare_case("deletion").await;
+}
+
+#[tokio::test]
+async fn response_branch_matches_openai() {
+    compare_case("branch").await;
+}
+
+#[tokio::test]
+async fn pagination_matches_openai() {
+    compare_case("pagination").await;
+}
+
+#[path = "conversations/replay.rs"]
+mod replay;
+
+const APRICOT: &str = "Remember the word APRICOT. Reply with only OK.";
+const COUNT: &str = "Count from 1 to 120, one number per line, digits only.";
+
+/// Message history as user text and generated item IDs, so recordings compare despite model wording.
+fn history(turn: &Turn) -> Vec<String> {
+    turn.response.body.as_ref().expect("list body")["data"]
+        .as_array()
+        .expect("list data")
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .map(|item| match item["role"].as_str() {
+            Some("user") => item["content"][0]["text"].as_str().expect("user text").to_owned(),
+            _ => item["id"].as_str().expect("item ID").to_owned(),
+        })
+        .collect()
+}
+
+fn output_id(turn: &Turn) -> String {
+    let body = result_body(&turn.response);
+    let output = body["output"].as_array().expect("response output");
+    let message = output
+        .iter()
+        .find(|item| item["type"] == "message")
+        .expect("output message");
+    message["id"].as_str().expect("message ID").to_owned()
+}
+
+/// Three conversations, each changed while its streamed turn B (t3, t10, t16) runs: t4 adds an item,
+/// t11 deletes A's first item, t17 deletes response A. B completes in every case, as on `OpenAI`.
+fn check_concurrent_writes(cassette: &Cassette) {
+    let turns = &cassette.turns;
+    assert_eq!(turns.len(), 22, "API step count");
+    for (index, turn) in turns.iter().enumerate() {
+        assert_eq!(turn.filename, format!("t{}", index + 1));
+        let status = if index == 21 { 404 } else { 200 };
+        assert_eq!(turn.response.status_code, status, "t{} status", index + 1);
+    }
+    for b in [2, 9, 15] {
+        assert_eq!(turns[b].request.body["input"][0]["content"], COUNT);
+        assert!(
+            sse_events(&turns[b].response)
+                .iter()
+                .all(|event| event["type"] != "error")
+        );
+        assert_eq!(lifecycle(&turns[b].response).last().unwrap(), "response.completed");
+    }
+    let started = |a: usize| vec![APRICOT.to_owned(), output_id(&turns[a]), COUNT.to_owned()];
+    let finished = |a: usize, b: usize| [started(a), vec![output_id(&turns[b])]].concat();
+
+    let mut expected = finished(1, 2);
+    expected.insert(2, "Side note: the marker is VIOLET.".to_owned());
+    assert_eq!(history(&turns[5]), expected, "side item precedes B's items");
+
+    let deleted = turns[8].response.body.as_ref().unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap();
+    assert!(turns[10].request.path.ends_with(&format!("/items/{deleted}")));
+    assert_eq!(history(&turns[12]), finished(7, 9)[1..], "deleted item stays deleted");
+
+    let response_a = result_body(&turns[14].response)["id"].as_str().unwrap().to_owned();
+    assert_eq!(turns[16].request.path, format!("/v1/responses/{response_a}"));
+    assert_eq!(turns[16].response.body.as_ref().unwrap()["deleted"], true);
+    assert_eq!(turns[21].request.path, turns[16].request.path);
+    assert_eq!(history(&turns[17]), started(14));
+    assert_eq!(
+        history(&turns[18]),
+        finished(14, 15),
+        "deleting a response keeps its items"
+    );
+    let follow_up = turns[19].request.body["input"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(history(&turns[20]), [finished(14, 15), vec![follow_up]].concat());
+    assert_answer(&turns[19], "APRICOT");
+
+    // B stores the history it started from: no side item, and still the deleted item.
+    assert_eq!(history(&turns[4]), started(1));
+    assert_eq!(history(&turns[11]), started(7));
+}
+
+#[test]
+fn conversation_turn_completes_when_the_conversation_changes_mid_stream() {
+    let Some((openai, gateway)) = pair("concurrent-writes") else {
+        return;
+    };
+    check_concurrent_writes(&openai);
+    check_concurrent_writes(&gateway);
+    compare_recordings("concurrent-writes", &openai, &gateway);
+}
+
+/// Whether a turn was refused with `conversation_locked`: an `error` event in its stream, or an error body.
+fn refused(turn: &Turn) -> bool {
+    let error = if turn.response.sse.is_some() {
+        sse_events(&turn.response)
+            .into_iter()
+            .find(|event| event["type"] == "error")
+            .map(|event| event["error"].clone())
+    } else {
+        turn.response.body.as_ref().and_then(|body| body.get("error")).cloned()
+    };
+    error.is_some_and(|error| error["code"] == "conversation_locked")
+}
+
+fn listed_items(turn: &Turn) -> &[Value] {
+    turn.response.body.as_ref().expect("list body")["data"]
+        .as_array()
+        .expect("list data")
+}
+
+fn assert_completed(turn: &Turn) {
+    assert_eq!(turn.response.status_code, 200, "{} status", turn.filename);
+    assert_eq!(
+        result_body(&turn.response)["status"],
+        "completed",
+        "{} status",
+        turn.filename
+    );
+}
+
+/// Two turns answer one pending call: streamed turn B (t3) and turn C (t4), sent while B streams. The second to
+/// commit is refused, the conversation (t5) keeps the other answer, and D (t8) continues with it.
+fn check_competing_tool_outputs(cassette: &Cassette) {
+    let turns = &cassette.turns;
+    assert_eq!(turns.len(), 9, "API step count");
+    let (b, c) = (&turns[2], &turns[3]);
+    assert_ne!(refused(b), refused(c), "exactly one answer is refused");
+    let kept = if refused(b) { c } else { b };
+    let kept_output = kept.request.body["input"][0]["output"].as_str().expect("tool output");
+    let outputs: Vec<_> = listed_items(&turns[4])
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["output"].as_str().expect("tool output"))
+        .collect();
+    assert_eq!(outputs, [kept_output], "the conversation keeps one answer");
+    assert_completed(&turns[7]);
+    let temperature =
+        serde_json::from_str::<Value>(kept_output).expect("tool output JSON")["temperature_c"].to_string();
+    assert_answer(&turns[7], &temperature);
+}
+
+#[test]
+fn competing_outputs_for_one_call_keep_the_conversation_usable() {
+    let Some((openai, gateway)) = pair("competing-tool-outputs") else {
+        return;
+    };
+    check_competing_tool_outputs(&openai);
+    check_competing_tool_outputs(&gateway);
+}
+
+/// Multi-agent turns B (streamed, t3) and C (t4, leaving a `get_weather` call pending) continue the same tree. C
+/// commits first, so B, which would replace C's tree, is refused; D (t6) answers C's call.
+fn check_overlapping_multi_agent(cassette: &Cassette) {
+    let turns = &cassette.turns;
+    assert_eq!(turns.len(), 7, "API step count");
+    assert!(refused(&turns[2]), "B, stored after C, is refused");
+    assert!(!refused(&turns[3]), "C commits");
+    assert_completed(&turns[5]);
+    assert!(response_text(&turns[5]).contains('7'), "D reports C's tool output");
+}
+
+#[test]
+fn overlapping_multi_agent_turns_keep_the_first_turns_pending_call() {
+    let Some((openai, gateway)) = pair("overlapping-multi-agent") else {
+        return;
+    };
+    check_overlapping_multi_agent(&openai);
+    check_overlapping_multi_agent(&gateway);
+}
+
+fn check_edge_case_recording(cassette: &Cassette) {
+    let turns = &cassette.turns;
+    assert_eq!(turns.len(), 19);
+    for (index, turn) in turns.iter().enumerate() {
+        assert_eq!(turn.filename, format!("t{}", index + 1));
+    }
+
+    for (start, kind) in [(0, "message"), (3, "function_call")] {
+        let conversation = &turns[start];
+        assert_eq!(conversation.request.method, "POST");
+        assert_eq!(conversation.request.path, "/v1/conversations");
+        assert_eq!(conversation.response.status_code, 200);
+        let conversation_id = conversation.response.body.as_ref().unwrap()["id"].as_str().unwrap();
+        let items_path = format!("/v1/conversations/{conversation_id}/items");
+        let creation = &turns[start + 1];
+        assert_eq!(creation.request.method, "POST");
+        assert_eq!(creation.request.path, items_path);
+        let requested = &creation.request.body["items"][0];
+        assert_eq!(requested["type"], kind);
+        let requested_id = requested["id"].as_str().expect("client-supplied ID");
+        let listing = &turns[start + 2];
+        assert_eq!(listing.request.method, "GET");
+        assert_eq!(listing.request.path, items_path);
+        assert_eq!(listing.response.status_code, 200);
+        assert_eq!(creation.response.status_code, 400);
+        assert!(all_listed_ids(listing).is_empty(), "rejected item was stored");
+        let prefix = if kind == "message" { "msg" } else { "fc" };
+        assert_eq!(
+            creation.response.body.as_ref().unwrap(),
+            &json!({"error": {
+                "code": "invalid_value", "param": "items[0].id", "type": "invalid_request_error",
+                "message": format!("Invalid 'items[0].id': '{requested_id}'. Expected an ID that begins with '{prefix}'.")
+            }})
+        );
+    }
+
+    let conversation = &turns[6];
+    assert_eq!(conversation.request.path, "/v1/conversations");
+    let conversation_id = conversation.response.body.as_ref().unwrap()["id"].as_str().unwrap();
+    let items_path = format!("/v1/conversations/{conversation_id}/items");
+    let creation = &turns[7];
+    assert_eq!(
+        (creation.request.method.as_str(), creation.request.path.as_str()),
+        ("POST", items_path.as_str())
+    );
+    assert_eq!(creation.response.status_code, 200);
+    let created = all_listed_ids(creation);
+    assert_eq!(created.len(), 3);
+    assert_eq!(created.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+    assert_eq!(
+        creation.request.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["content"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["msg1", "msg2", "msg3"]
+    );
+
+    let page = &turns[8];
+    assert_eq!(
+        (page.request.method.as_str(), page.request.path.as_str()),
+        ("GET", items_path.as_str())
+    );
+    assert_eq!(page.request.query_params, json!({"limit": "2"}));
+    assert_eq!(page.response.status_code, 200);
+    let page_ids = all_listed_ids(page);
+    assert_eq!(page_ids, vec![created[2], created[1]]);
+    let page_body = page.response.body.as_ref().unwrap();
+    assert_eq!(page_body["first_id"], page_ids[0]);
+    assert_eq!(page_body["last_id"], page_ids[1]);
+    assert_eq!(page_body["has_more"], true);
+
+    let deletion = &turns[9];
+    assert_eq!(deletion.request.method, "DELETE");
+    assert_eq!(deletion.request.path, format!("{items_path}/{}", page_ids[1]));
+    assert_eq!(deletion.response.status_code, 200);
+    let after = &turns[10];
+    assert_eq!(
+        (after.request.method.as_str(), after.request.path.as_str()),
+        ("GET", items_path.as_str())
+    );
+    assert_eq!(after.request.query_params, json!({"after": page_ids[1], "limit": "2"}));
+    assert_eq!(after.response.status_code, 404);
+}
+
+#[test]
+fn edge_case_recordings_preserve_item_ids_and_deleted_cursor_behavior() {
+    let (openai, gateway) = pair("edge-cases").expect("edge-case recordings");
+    check_edge_case_recording(&openai);
+    check_edge_case_recording(&gateway);
+
+    let mut ids = IdPairs::default();
+    for (index, (left, right)) in openai.turns.iter().zip(&gateway.turns).enumerate() {
+        let location = format!("edge-cases t{}", index + 1);
+        assert_eq!(left.request.method, right.request.method, "{location}: method");
+        compare_path(&left.request.path, &right.request.path, &mut ids);
+        compare_value(
+            &left.request.query_params,
+            &right.request.query_params,
+            &location,
+            &mut ids,
+            false,
+        );
+        compare_value(&left.request.body, &right.request.body, &location, &mut ids, false);
+        assert_eq!(
+            left.response.status_code, right.response.status_code,
+            "{location}: status"
+        );
+        assert!(left.response.sse.is_none() && right.response.sse.is_none());
+        let mut expected = left.response.body.clone().expect("OpenAI response body");
+        remap_error_message(&mut expected, &ids);
+        compare_value(
+            &expected,
+            right.response.body.as_ref().expect("gateway response body"),
+            &location,
+            &mut ids,
+            false,
+        );
+    }
+}
+
+#[tokio::test]
+async fn supplied_id_validation_matches_recorded_openai_errors() {
+    use agentic_core::executor::ConversationHandler;
+    use agentic_core::storage::ConversationStore;
+    use agentic_core::types::conversations::CreateItemRequest;
+
+    let reference = cassette("edge-cases", "openai").expect("OpenAI edge-case recording");
+    // Disabled storage proves validation happens before any database operation.
+    let handler = ConversationHandler::new(ConversationStore::disabled());
+    for index in [1, 4] {
+        let turn = &reference.turns[index];
+        let request: CreateItemRequest = serde_json::from_value(turn.request.body.clone()).unwrap();
+        let errors = [
+            handler
+                .create_items("tenant", "conv_unused", request.items.clone())
+                .await
+                .unwrap_err(),
+            handler
+                .create("tenant", &ConversationMetadata::new(), &request.items)
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.http_status().as_u16(), turn.response.status_code);
+            let body: Value = serde_json::from_slice(&error.into_response_body()).unwrap();
+            assert_eq!(&body, turn.response.body.as_ref().unwrap());
+        }
+    }
+}
+
+#[test]
+fn both_providers_reuse_item_identity_and_preserve_duplicate_occurrences() {
+    let (openai, gateway) = pair("edge-cases").expect("edge-case recordings");
+    for recording in [&openai, &gateway] {
+        check_reused_item_occurrences(recording);
+    }
+}
+
+fn check_reused_item_occurrences(recording: &Cassette) {
+    let turns = &recording.turns;
+    assert_eq!(turns.len(), 19);
+    let original = &turns[7].response.body.as_ref().unwrap()["data"][2];
+    let public_id = original["id"].as_str().unwrap();
+    for (start, count) in [(11, 1), (14, 2)] {
+        let conversation_id = turns[start].response.body.as_ref().unwrap()["id"].as_str().unwrap();
+        let path = format!("/v1/conversations/{conversation_id}/items");
+        let creation = &turns[start + 1];
+        assert_eq!(creation.request.path, path);
+        assert_eq!(creation.response.status_code, 200);
+        let requested = creation.request.body["items"].as_array().unwrap();
+        assert_eq!(requested.len(), count);
+        for item in requested {
+            assert_eq!(item["id"], public_id);
+            assert_ne!(item["content"], original["content"]);
+        }
+        let expected = vec![original.clone(); count];
+        assert_eq!(creation.response.body.as_ref().unwrap()["data"], json!(expected));
+        let listing = &turns[start + 2];
+        assert_eq!(listing.request.path, path);
+        assert_eq!(listing.request.query_params, json!({"order": "asc"}));
+        assert_eq!(listing.response.status_code, 200);
+        assert_eq!(listing.response.body.as_ref().unwrap()["data"], json!(expected));
+    }
+    assert_eq!(turns[17].response.status_code, 400);
+    assert_eq!(
+        turns[17].response.body.as_ref().unwrap(),
+        &json!({"error": {
+            "type": "invalid_request_error", "code": "item_already_in_conversation",
+            "param": "items", "message": "Item already in conversation"
+        }})
+    );
+    let original_items = turns[7].response.body.as_ref().unwrap()["data"].as_array().unwrap();
+    assert_eq!(
+        turns[18].response.body.as_ref().unwrap()["data"],
+        json!([original_items[0], original_items[2]])
+    );
+}
+
+#[tokio::test]
+async fn existing_conversation_item_error_matches_openai_recording() {
+    use agentic_core::executor::ExecutorError;
+    use agentic_core::storage::{ConversationStore, create_pool_with_schema};
+    use agentic_core::types::conversations::CreateItemRequest;
+    use agentic_core::types::io::InOutItem;
+
+    let reference = cassette("edge-cases", "openai").expect("OpenAI edge-case recording");
+    let pool = create_pool_with_schema(Some("sqlite::memory:")).await.unwrap();
+    let store = ConversationStore::new(pool);
+    let source = &reference.turns[7].response.body.as_ref().unwrap()["data"][2];
+    let original = InOutItem::Input(serde_json::from_value(source.clone()).unwrap());
+    let conversation = store
+        .create("default_tenant", &ConversationMetadata::new(), &[original])
+        .await
+        .unwrap();
+    let before = store.rehydrate(&conversation.conversation_id).await.unwrap();
+    let request: CreateItemRequest = serde_json::from_value(reference.turns[17].request.body.clone()).unwrap();
+    let error: ExecutorError = store
+        .create_items("default_tenant", &conversation.conversation_id, request.items)
+        .await
+        .unwrap_err()
+        .into();
+    assert_eq!(error.http_status().as_u16(), reference.turns[17].response.status_code);
+    let body: Value = serde_json::from_slice(&error.into_response_body()).unwrap();
+    assert_eq!(&body, reference.turns[17].response.body.as_ref().unwrap());
+    let after = store.rehydrate(&conversation.conversation_id).await.unwrap();
+    assert_eq!(after.items, before.items);
+}
+
+#[tokio::test]
+async fn deleted_cursor_error_body_matches_openai_recording() {
+    use agentic_core::executor::ExecutorError;
+    use agentic_core::storage::{ConversationStore, create_pool_with_schema};
+    use agentic_core::types::io::InOutItem;
+    use agentic_core::types::io::ItemOrder;
+
+    let reference = cassette("edge-cases", "openai").expect("OpenAI edge-case recording");
+    let pool = create_pool_with_schema(Some("sqlite::memory:")).await.unwrap();
+    let store = ConversationStore::new(pool);
+    let items = reference.turns[7].response.body.as_ref().unwrap()["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| InOutItem::Input(serde_json::from_value(value.clone()).unwrap()))
+        .collect::<Vec<_>>();
+    let conversation = store
+        .create("tenant", &ConversationMetadata::new(), &items)
+        .await
+        .unwrap();
+    let cursor = reference.turns[10].request.query_params["after"].as_str().unwrap();
+    store
+        .delete_item("tenant", &conversation.conversation_id, cursor)
+        .await
+        .unwrap();
+    for order in [ItemOrder::Asc, ItemOrder::Desc] {
+        let error: ExecutorError = store
+            .list_items("tenant", &conversation.conversation_id, 2, Some(cursor), order)
+            .await
+            .unwrap_err()
+            .into();
+        assert_eq!(error.http_status().as_u16(), reference.turns[10].response.status_code);
+        let body: Value = serde_json::from_slice(&error.into_response_body()).unwrap();
+        assert_eq!(&body, reference.turns[10].response.body.as_ref().unwrap());
+    }
+}
+
+#[path = "conversations/edge_replay.rs"]
+mod edge_replay;

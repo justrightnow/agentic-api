@@ -1,0 +1,300 @@
+use std::future::Future;
+use std::pin::Pin;
+
+use super::registry::ToolType;
+
+use crate::types::io::input::hosted_search_output_text;
+use crate::types::io::output::{FunctionToolCall, GatewayCallStatus, OutputItem};
+use crate::types::io::{FunctionTool, InputItem, InputToolSearchCall, ToolSearchCall, ToolSearchOutputMessage};
+use crate::types::tools::ToolSearchStatus;
+
+pub(crate) const MAX_GATEWAY_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Whether a handler's output is the tool's answer or a failure the tool
+/// reports to the model in its own documented shape.
+///
+/// Set by the handler that produced the output and carried unchanged through
+/// dispatch, so a loop never has to parse an output to learn its status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutputStatus {
+    /// The output is the tool's answer.
+    Success,
+    /// The output reports a failure the model should treat as an error, such
+    /// as a documented `web_fetch_tool_result_error`.
+    Failure,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    pub call_id: String,
+    pub output: String,
+    pub status: ToolOutputStatus,
+}
+
+impl ToolOutput {
+    /// An output that is the tool's answer.
+    #[must_use]
+    pub fn success(call_id: impl Into<String>, output: impl Into<String>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            output: output.into(),
+            status: ToolOutputStatus::Success,
+        }
+    }
+
+    /// An output that reports a failure in the tool's own documented shape.
+    #[must_use]
+    pub fn failure(call_id: impl Into<String>, output: impl Into<String>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            output: output.into(),
+            status: ToolOutputStatus::Failure,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_failure(&self) -> bool {
+        matches!(self.status, ToolOutputStatus::Failure)
+    }
+}
+
+/// Tool-owned public lifecycle projection for one scheduled gateway call.
+///
+/// Handlers provide typed Responses output items while the gateway scheduler
+/// remains responsible for output indexes, SSE framing, and event ordering.
+#[derive(Debug, Clone, Default)]
+pub struct GatewayToolEventPlan {
+    started_output: Option<OutputItem>,
+    planned_result: Option<PlannedResult>,
+}
+
+impl GatewayToolEventPlan {
+    #[must_use]
+    pub const fn new(started_output: Option<OutputItem>) -> Self {
+        Self {
+            started_output,
+            planned_result: None,
+        }
+    }
+
+    /// The call's result, known when it is planned; the gateway records it instead of executing the call.
+    #[must_use]
+    pub(crate) fn with_planned_result(mut self, result: PlannedResult) -> Self {
+        self.planned_result = Some(result);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (Option<OutputItem>, Option<PlannedResult>) {
+        (self.started_output, self.planned_result)
+    }
+}
+
+/// A gateway call's result that its tool knows when the call is planned, so the call is never executed. Its items are
+/// the model's next input; the upstream projection lowers them for the model.
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedResult {
+    /// A hosted search: its completed public call, and the output that follows it at the next output index.
+    SearchPair {
+        call: ToolSearchCall,
+        history_call: InputToolSearchCall,
+        output: ToolSearchOutputMessage,
+    },
+}
+
+impl PlannedResult {
+    /// A hosted search's result: `call` completed, recorded in history as its input form.
+    pub(crate) fn search_pair(call: ToolSearchCall, output: ToolSearchOutputMessage) -> Self {
+        let history_call = InputToolSearchCall {
+            agent: call.agent.clone(),
+            id: call.id.clone(),
+            call_id: call.call_id.clone(),
+            execution: call.execution,
+            arguments: call.arguments.clone(),
+            status: ToolSearchStatus::Completed,
+        };
+        Self::SearchPair {
+            call: ToolSearchCall {
+                status: ToolSearchStatus::Completed,
+                ..call
+            },
+            history_call,
+            output,
+        }
+    }
+
+    /// The call's own public item once it is complete.
+    pub(crate) fn completed_output(&self) -> OutputItem {
+        match self {
+            Self::SearchPair { call, .. } => OutputItem::ToolSearchCall(call.clone()),
+        }
+    }
+
+    /// The public item that follows the call's own at the next output index.
+    pub(crate) fn follow_up_output(&self) -> OutputItem {
+        match self {
+            Self::SearchPair { output, .. } => OutputItem::ToolSearchOutput(output.clone()),
+        }
+    }
+
+    /// The items appended for the model's next round.
+    pub(crate) fn input_items(&self) -> Vec<InputItem> {
+        match self {
+            Self::SearchPair {
+                history_call, output, ..
+            } => vec![
+                InputItem::ToolSearchCall(history_call.clone()),
+                InputItem::ToolSearchOutput(output.clone()),
+            ],
+        }
+    }
+
+    /// The size of the output the model reads, bounded like an executed call's output.
+    pub(crate) fn model_output_len(&self) -> usize {
+        match self {
+            Self::SearchPair { output, .. } => hosted_search_output_text(&output.tools).len(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToolError {
+    #[error("execution failed: {0}")]
+    Execution(String),
+    #[error("file_search failed: {}", .0.public_message())]
+    FileSearch(#[from] crate::types::file_search::FileSearchError),
+    #[error("invalid tool config: {0}")]
+    Config(String),
+    #[error("upstream returned an invalid tool-search call")]
+    InvalidUpstreamToolSearch,
+    #[error("upstream returned a call for a function that has not been loaded")]
+    UpstreamWithheldFunctionCall,
+    /// A continuation request omitted the output for a pending function call
+    /// from the prior turn.
+    #[error("No tool output found for function call {call_id}.")]
+    MissingOutput { call_id: String },
+    /// A continuation request supplied an output for a call that does not exist in its history.
+    #[error("No tool call found for function call output with call_id {call_id}.")]
+    UnknownCallOutput { call_id: String },
+    /// A tool declaration carries a parameter its type does not accept, such as `async` on a
+    /// hosted tool. `param` is the request path, for example `tools[0].async`.
+    #[error("Unknown parameter: '{param}'.")]
+    UnknownParameter { param: String },
+}
+
+/// Trait implemented by every tool type — client-owned and gateway-owned alike.
+///
+/// Covers typed validation and normalization: the steps that apply to all
+/// tools regardless of who executes them.
+pub trait ToolHandler: Send + Sync {
+    /// The public declaration parameters handled by this implementation.
+    type ToolParams: Send + Sync;
+
+    #[must_use]
+    fn tool_type(&self) -> ToolType;
+
+    /// Validate the typed tool declaration parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Config`] for obviously invalid configurations.
+    fn validate(&self, params: &Self::ToolParams) -> Result<(), ToolError>;
+
+    /// Normalise this tool declaration into vLLM-compatible `FunctionTool` entries.
+    #[must_use]
+    fn normalize(&self, params: &Self::ToolParams) -> Vec<FunctionTool>;
+}
+
+/// Extension of [`ToolHandler`] for tool types that are executed by the gateway.
+///
+/// Only executable gateway handlers implement this trait. MCP, web search, and
+/// file search implement it unconditionally; the Eryx-backed code interpreter
+/// implements it when its Cargo feature is enabled. Client-owned tools (`Function`,
+/// `ToolSearch`, `Custom`, `CodexNamespace`) do not implement it, so they cannot
+/// be dispatched through this interface.
+///
+/// ## Note on `async fn` in traits
+///
+/// Native `async fn` in traits (Rust 1.75+) is not yet `dyn`-compatible, so this
+/// trait uses explicit `Pin<Box<dyn Future>>` return types. Concrete executors
+/// are paired with their typed parameters before the pair is erased for storage
+/// in the heterogeneous tool registry.
+pub trait GatewayExecutor: ToolHandler + 'static {
+    /// Request-scoped parameters for one model-visible executable tool.
+    ///
+    /// These may differ from [`ToolHandler::ToolParams`]. MCP, for example,
+    /// normalizes an [`McpToolParam`](crate::types::tools::McpToolParam) server
+    /// declaration but executes one
+    /// [`McpDiscoveredToolParam`](crate::types::tools::McpDiscoveredToolParam).
+    type ExecutionParams: Clone + Send + Sync + 'static;
+
+    /// Execute a tool call and return the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Execution`] if the tool call fails.
+    fn execute(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        params: &Self::ExecutionParams,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>;
+
+    /// Whether multiple calls to this same model-visible tool name may overlap.
+    /// Defaults to `false`, which serializes only same-name calls; calls to
+    /// different tools may still execute concurrently in the same round.
+    #[must_use]
+    fn supports_parallel_execution(&self) -> bool {
+        false
+    }
+
+    /// Plans the typed public lifecycle for one gateway call.
+    ///
+    /// The returned plan must not assign protocol indexes or construct SSE
+    /// frames. Defaults to the handler's [`Self::started_output`].
+    #[must_use]
+    fn plan_gateway_events(&self, call: &FunctionToolCall, params: &Self::ExecutionParams) -> GatewayToolEventPlan {
+        GatewayToolEventPlan::new(self.started_output(call, params))
+    }
+
+    /// The item shown while this call is in progress: the start of its public item.
+    #[must_use]
+    fn started_output(&self, call: &FunctionToolCall, params: &Self::ExecutionParams) -> Option<OutputItem>;
+
+    /// The public item for a completed or failed call: what the client receives and history stores in place of the
+    /// model-facing call and its output. A handler returns `None` only for a tool with no Responses item (`web_fetch`,
+    /// which Messages answers with its own result blocks).
+    #[must_use]
+    fn public_output(
+        &self,
+        call: &FunctionToolCall,
+        output: &ToolOutput,
+        status: GatewayCallStatus,
+        params: &Self::ExecutionParams,
+    ) -> Option<OutputItem>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    // Compile-time check: a GatewayExecutor with fixed associated parameter
+    // types remains dyn-compatible for typed executor slots.
+    fn _assert_gateway_executor_dyn_compatible(_: Arc<dyn GatewayExecutor<ToolParams = (), ExecutionParams = ()>>) {}
+
+    #[test]
+    fn an_output_carries_the_status_its_constructor_set() {
+        let answer = ToolOutput::success("call_1", "42");
+        assert_eq!(answer.call_id, "call_1");
+        assert_eq!(answer.output, "42");
+        assert_eq!(answer.status, ToolOutputStatus::Success);
+        assert!(!answer.is_failure());
+
+        let refusal = ToolOutput::failure("call_2", r#"{"error":"refused"}"#);
+        assert_eq!(refusal.status, ToolOutputStatus::Failure);
+        assert!(refusal.is_failure());
+    }
+}

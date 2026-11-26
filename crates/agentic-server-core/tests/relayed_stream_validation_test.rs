@@ -1,0 +1,494 @@
+#[path = "support/multi_agent_contract.rs"]
+pub mod multi_agent_contract;
+mod support;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use agentic_core::events::{EventPayload, SSEItemType, normalize_sse_line};
+use agentic_core::executor::accumulator::ResponseAccumulator;
+use agentic_core::executor::request::RequestContext;
+use agentic_core::executor::{UpstreamBody, decode_upstream};
+use agentic_core::types::io::{OutputAnnotation, OutputItem, OutputMessageContent};
+use agentic_core::types::request_response::RequestPayload;
+use multi_agent_contract::RecordedSession;
+use serde_json::json;
+
+fn request_context() -> RequestContext {
+    let request: RequestPayload = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": "hi",
+        "store": true,
+        "stream": true
+    }))
+    .expect("valid request");
+    RequestContext {
+        multi_agent_tree: None,
+        original_request: request.clone(),
+        enriched_request: request,
+        new_input_items: Vec::new(),
+        response_id: "resp_reserved".to_owned(),
+        conversation_id: None,
+        checkpoint: None,
+        continuation: None,
+    }
+}
+
+#[tokio::test]
+async fn strict_relay_decoder_preserves_public_file_citations_in_json_and_sse() {
+    let annotations = json!([{"type":"file_citation","file_id":"file_public","filename":"policy.txt","index":0}]);
+    let item = json!({
+        "type":"message", "id":"msg_public", "role":"assistant", "status":"completed",
+        "content":[{"type":"output_text","text":"The policy applies.","annotations":annotations}]
+    });
+    let response = json!({"id":"resp_upstream","status":"completed","output":[item]});
+    let json_body = response.to_string();
+    let stream = [
+        json!({"type":"response.created","response":{"id":"resp_upstream","status":"in_progress"}}),
+        json!({"type":"response.in_progress","response":{"id":"resp_upstream","status":"in_progress"}}),
+        json!({"type":"response.output_item.added","output_index":0,
+            "item":{"type":"message","id":"msg_public","role":"assistant","status":"in_progress","content":[]}}),
+        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        json!({"type":"response.completed","response":response}),
+    ]
+    .map(|event| format!("data: {event}"))
+    .join("\n");
+
+    for body in [UpstreamBody::Json(&json_body), UpstreamBody::Sse(&stream)] {
+        let (payload, _) = decode_upstream(request_context(), body)
+            .await
+            .expect("valid public response");
+        let OutputItem::Message(message) = &payload.output[0] else {
+            panic!("expected assistant message");
+        };
+        let OutputMessageContent::OutputText(text) = &message.content[0] else {
+            panic!("expected output text");
+        };
+        assert!(matches!(
+            text.annotations.as_deref(),
+            Some([OutputAnnotation::FileCitation(_)])
+        ));
+        let output = serde_json::to_value(payload.output).expect("typed output");
+        assert_eq!(output[0]["content"][0]["annotations"], annotations);
+    }
+}
+
+fn yaml_files(root: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![root.to_owned()];
+    let mut files = Vec::new();
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())) {
+            let path = entry.expect("cassette directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "yaml") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn response_streams(path: &Path) -> Vec<Vec<String>> {
+    let text = fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let document: serde_json::Value =
+        serde_yaml::from_str(&text).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+
+    if let Some(sse) = document["sse"].as_array() {
+        return vec![
+            sse.iter()
+                .map(|chunk| chunk.as_str().expect("SSE chunk string").to_owned())
+                .collect(),
+        ];
+    }
+
+    document["turns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|turn| turn["request"]["path"] == "/v1/responses")
+        .filter_map(|turn| turn["response"]["sse"].as_array())
+        .map(|sse| {
+            sse.iter()
+                .map(|chunk| chunk.as_str().expect("SSE chunk string").to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+fn is_responses_event_stream(stream: &str) -> bool {
+    stream.lines().any(|line| {
+        line.strip_prefix("data: ")
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .is_some_and(|event| event["type"] == "response.created")
+    })
+}
+
+fn message_stream(terminal_ids: [&str; 2]) -> String {
+    [
+        json!({
+            "type": "response.created",
+            "response": {"id": "resp_upstream", "status": "in_progress"}
+        }),
+        json!({
+            "type": "response.in_progress",
+            "response": {"id": "resp_upstream", "status": "in_progress"}
+        }),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "msg_streamed_0", "type": "message", "role": "assistant", "status": "in_progress"}
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {"id": "msg_streamed_0", "type": "message", "role": "assistant", "status": "completed"}
+        }),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {"id": "msg_streamed_1", "type": "message", "role": "assistant", "status": "in_progress"}
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {"id": "msg_streamed_1", "type": "message", "role": "assistant", "status": "completed"}
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_upstream",
+                "status": "completed",
+                "output": [
+                    {"id": terminal_ids[0], "type": "message", "role": "assistant", "status": "completed"},
+                    {"id": terminal_ids[1], "type": "message", "role": "assistant", "status": "completed"}
+                ]
+            }
+        }),
+    ]
+    .map(|event| format!("data: {event}"))
+    .join("\n")
+}
+
+#[tokio::test]
+async fn strict_relay_decoder_accepts_data_lines_without_a_space() {
+    let stream = message_stream(["msg_terminal_0", "msg_terminal_1"]).replace("data: ", "data:");
+
+    decode_upstream(request_context(), UpstreamBody::Sse(&stream))
+        .await
+        .map(|(payload, _)| payload)
+        .expect("SSE data fields may omit the optional space after the colon");
+}
+
+#[tokio::test]
+async fn completed_terminal_details_are_preserved_by_both_ingestion_paths() {
+    let error = json!({"code": "upstream_error", "message": "Provider supplied terminal details"});
+    let lines = [
+        json!({"type": "response.created", "response": {"id": "resp_upstream", "status": "in_progress"}}),
+        json!({"type": "response.in_progress", "response": {"id": "resp_upstream", "status": "in_progress"}}),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_upstream",
+                "status": "completed",
+                "output": [],
+                "error": error.clone(),
+                "incomplete_details": {"reason": "upstream_error"}
+            }
+        }),
+    ]
+    .map(|event| format!("data: {event}"));
+
+    let strict = decode_upstream(request_context(), UpstreamBody::Sse(&lines.join("\n")))
+        .await
+        .map(|(payload, _)| payload)
+        .expect("valid completed stream");
+    let lenient = ResponseAccumulator::from_sse_lines(lines, None)
+        .expect("valid completed stream")
+        .finalize("test-model", None, None);
+
+    for (policy, payload) in [("strict", strict), ("lenient", lenient)] {
+        assert_eq!(payload.status, "completed", "{policy}");
+        assert_eq!(payload.error.as_ref(), Some(&error), "{policy}");
+        assert_eq!(
+            payload
+                .incomplete_details
+                .as_ref()
+                .and_then(|details| details.reason.as_deref()),
+            Some("upstream_error"),
+            "{policy}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_relay_decoder_rejects_duplicate_terminal_item_ids() {
+    let stream = message_stream(["msg_terminal", "msg_terminal"]);
+
+    let error = decode_upstream(request_context(), UpstreamBody::Sse(&stream))
+        .await
+        .map(|(payload, _)| payload)
+        .expect_err("duplicate terminal item ids must be rejected");
+    assert!(error.to_string().contains("repeats output item 'msg_terminal'"));
+}
+
+#[tokio::test]
+async fn strict_relay_decoder_rejects_repeated_item_done() {
+    let stream = message_stream(["msg_terminal_0", "msg_terminal_1"]);
+    let mut lines: Vec<_> = stream.lines().collect();
+    lines.insert(4, lines[3]);
+    let stream = lines.join("\n");
+
+    let error = decode_upstream(request_context(), UpstreamBody::Sse(&stream))
+        .await
+        .map(|(payload, _)| payload)
+        .expect_err("strict validation must reject a second completion for the same item");
+
+    assert!(error.to_string().contains("has no active output item"));
+}
+
+#[tokio::test]
+async fn strict_relay_decoder_rejects_item_id_with_the_wrong_output_index() {
+    let stream = message_stream(["msg_terminal_0", "msg_terminal_1"]);
+    let stream = stream.replace(
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_streamed_0""#,
+        r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"msg_streamed_0""#,
+    );
+
+    let error = decode_upstream(request_context(), UpstreamBody::Sse(&stream))
+        .await
+        .map(|(payload, _)| payload)
+        .expect_err("an item id must not resolve through a different explicit output index");
+
+    assert!(error.to_string().contains("does not match its active output item"));
+}
+
+#[tokio::test]
+async fn strict_relay_decoder_rejects_changed_call_id_without_terminal_output() {
+    let stream = [
+        json!({"type": "response.created", "response": {"id": "resp_upstream", "status": "in_progress"}}),
+        json!({"type": "response.in_progress", "response": {"id": "resp_upstream", "status": "in_progress"}}),
+        json!({"type": "response.output_item.added", "output_index": 0, "item": {"id": "fc_1", "type": "function_call", "status": "in_progress", "call_id": "call_1", "name": "lookup", "arguments": ""}}),
+        json!({"type": "response.function_call_arguments.done", "output_index": 0, "item_id": "fc_1", "call_id": "call_2", "arguments": "{}"}),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": {"id": "fc_1", "type": "function_call", "status": "completed", "call_id": "call_2", "name": "lookup", "arguments": "{}"}}),
+        json!({"type": "response.completed", "response": {"id": "resp_upstream", "status": "completed"}}),
+    ]
+    .map(|event| format!("data: {event}"))
+    .join("\n");
+
+    let error = decode_upstream(request_context(), UpstreamBody::Sse(&stream))
+        .await
+        .map(|(payload, _)| payload)
+        .expect_err("call-id stability must not depend on terminal output being present");
+
+    assert!(error.to_string().contains("changes 'call_id' for output[0]"));
+}
+
+#[tokio::test]
+async fn strict_relay_decoder_rejects_unsupported_item_type() {
+    let stream = message_stream(["msg_terminal_0", "msg_terminal_1"]).replace("\"message\"", "\"unsupported_item\"");
+
+    let error = decode_upstream(request_context(), UpstreamBody::Sse(&stream))
+        .await
+        .map(|(payload, _)| payload)
+        .expect_err("unsupported item types must be rejected before lifecycle validation");
+
+    assert!(
+        error
+            .to_string()
+            .contains("output item type 'unsupported_item' is unsupported")
+    );
+}
+
+#[tokio::test]
+async fn strict_relay_decoder_preserves_web_search_item_id_fallback() {
+    for id in [Some(json!("ws_1")), None, Some(json!(null)), Some(json!(""))] {
+        for include_terminal_output in [false, true] {
+            let mut item = json!({
+                "type": "web_search_call",
+                "item_id": "ws_1",
+                "status": "completed",
+                "action": {"type": "search", "query": "rust", "sources": []}
+            });
+            if let Some(id) = &id {
+                item["id"] = id.clone();
+            }
+            let mut terminal = json!({"id": "resp_upstream", "status": "completed"});
+            if include_terminal_output {
+                terminal["output"] = json!([item.clone()]);
+            }
+            let stream = [
+                json!({"type": "response.created", "response": {"id": "resp_upstream", "status": "in_progress"}}),
+                json!({"type": "response.in_progress", "response": {"id": "resp_upstream", "status": "in_progress"}}),
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"}}),
+                json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+                json!({"type": "response.completed", "response": terminal}),
+            ]
+            .map(|event| format!("data: {event}"))
+            .join("\n");
+
+            let (payload, _) = decode_upstream(request_context(), UpstreamBody::Sse(&stream))
+                .await
+                .unwrap_or_else(|error| panic!("id={id:?}, terminal output={include_terminal_output}: {error}"));
+
+            assert_eq!(
+                payload.output.len(),
+                1,
+                "id={id:?}, terminal output={include_terminal_output}"
+            );
+            let OutputItem::WebSearchCall(call) = &payload.output[0] else {
+                panic!("expected web-search call");
+            };
+            assert_eq!(call.id, "ws_1");
+            assert_eq!(serde_json::to_value(&call.action).unwrap()["query"], "rust");
+        }
+    }
+}
+
+const RECORDED_UPSTREAM_INCOMPATIBILITIES: [(&str, &str, usize, usize); 5] = [
+    (
+        "store_false/multi-agent-store-false-model-dependencies-streaming.yaml",
+        "invalid request: upstream stream event does not match its active output item: inconsistent item ID, output_index, or kind",
+        17,
+        0,
+    ),
+    (
+        "store_false/multi-agent-store-false-openai-reference-code-interpreter-gpt-5.6-sol-streaming.yaml",
+        "invalid request: upstream stream event does not match its active output item: inconsistent item ID, output_index, or kind",
+        1,
+        0,
+    ),
+    // OpenAI refused the streamed turn B with a `conversation_locked` error event after its output, so the stream has
+    // no terminal response event.
+    (
+        "conversations/conversations-competing-tool-outputs-openai.yaml",
+        "invalid request: upstream stream ended without a terminal event",
+        1,
+        0,
+    ),
+    // OpenAI, and the gateway, refuse the streamed multi-agent turn B the same way after turn C committed.
+    (
+        "conversations/conversations-overlapping-multi-agent-openai.yaml",
+        "invalid request: upstream stream ended without a terminal event",
+        1,
+        0,
+    ),
+    (
+        "conversations/conversations-overlapping-multi-agent-gateway.yaml",
+        "invalid request: upstream stream ended without a terminal event",
+        1,
+        0,
+    ),
+];
+
+#[tokio::test]
+async fn strict_relay_decoder_accepts_compatible_recorded_responses_streams() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cassettes");
+    let mut decoded = 0;
+    let mut rejected = Vec::new();
+    // Preserve raw recordings, including their incompatibilities. Pin each
+    // rejection to its capture, exact error, and number of streamed turns.
+    // Live gateway output is validated separately by multi_agent_stateless.
+    let mut recorded_incompatibilities = RECORDED_UPSTREAM_INCOMPATIBILITIES;
+    let mut public_hosted_sessions = 0;
+
+    // Hosted searches execute in the gateway; their public search items are not upstream model events.
+    let gateway_executed = root.join("hosted_tool_search");
+    for path in yaml_files(&root)
+        .into_iter()
+        .filter(|path| !path.starts_with(&gateway_executed))
+    {
+        let relative = path.strip_prefix(&root).expect("cassette below root");
+        let streams = response_streams(&path);
+        if streams.iter().any(|chunks| {
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.lines())
+                .filter_map(normalize_sse_line)
+                .any(|frame| {
+                    matches!(
+                        frame.payload,
+                        EventPayload::OutputItemAdded {
+                            item_type: SSEItemType::ToolSearchOutput,
+                            ..
+                        }
+                    )
+                })
+        }) {
+            // A hosted tool_search_output is a public gateway projection, never a model output item.
+            // Validate the whole session's strict public lifecycle and callback ownership instead.
+            let session = RecordedSession::load(&path).unwrap();
+            session.assert_stateless().unwrap();
+            session.assert_client_owned_tools().unwrap();
+            session.assert_hosted_tool_search_continuation().unwrap();
+            public_hosted_sessions += 1;
+            continue;
+        }
+        for (turn_index, chunks) in streams.into_iter().enumerate() {
+            let stream = chunks.join("\n");
+            if !is_responses_event_stream(&stream) {
+                continue;
+            }
+            let result = decode_upstream(request_context(), UpstreamBody::Sse(&stream))
+                .await
+                .map(|(payload, _)| payload);
+            if let Some((_, expected_error, _, observed)) = recorded_incompatibilities
+                .iter_mut()
+                .find(|(capture, _, _, _)| relative == Path::new(capture))
+            {
+                let error = result.expect_err("recorded strict-relay incompatibility changed");
+                assert_eq!(
+                    error.to_string(),
+                    *expected_error,
+                    "{} stream {}",
+                    relative.display(),
+                    turn_index + 1
+                );
+                *observed += 1;
+                continue;
+            }
+            match result {
+                Ok(_) => decoded += 1,
+                Err(error) => rejected.push(format!("{} turn {}: {error}", relative.display(), turn_index + 1)),
+            }
+        }
+    }
+
+    assert_eq!(
+        public_hosted_sessions, 2,
+        "both hosted multi-agent provider sessions must validate"
+    );
+    for (capture, _, expected, observed) in recorded_incompatibilities {
+        assert_eq!(observed, expected, "recorded incompatibility count: {capture}");
+    }
+    // This stateless gateway capture is raw upstream pass-through. vLLM emits
+    // message content-part events for a reasoning item; strict ingestion must
+    // reject it. Keep this exact observed failure distinct from valid streams.
+    let invalid_passthrough = concat!(
+        "responses/response-edge-cases-stream-gateway.yaml turn 1: ",
+        "invalid request: upstream stream event does not match its active output item: ",
+        "inconsistent item ID, output_index, or kind"
+    );
+    assert!(rejected.iter().any(|failure| failure == invalid_passthrough));
+    let unexpected: Vec<_> = rejected
+        .iter()
+        .filter(|failure| !failure.contains("changes 'call_id'") && failure.as_str() != invalid_passthrough)
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "recorded streams failed beyond the characterized upstream incompatibilities:\n{}",
+        unexpected
+            .iter()
+            .map(|failure| failure.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        rejected.len(),
+        11,
+        "the recorded upstream incompatibility baseline changed:\n{}",
+        rejected.join("\n")
+    );
+    assert!(decoded >= 50, "decoded only {decoded} recorded Responses SSE streams");
+}

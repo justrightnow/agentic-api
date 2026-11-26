@@ -1,0 +1,524 @@
+use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::messages_threads::MessagesThreadStore;
+use crate::config::{Config, ResponsesConfig, SqliteConfig, default_database_url};
+use crate::error::Error;
+use crate::executor::error::{ExecutorError, ExecutorResult};
+use crate::executor::gateway::GatewaySchedulerPolicy;
+use crate::executor::messages_server_tools::sealing::{MessagesResultKey, process_result_key};
+use crate::executor::modes::{ConversationHandler, ResponseHandler};
+use crate::executor::multi_agent::ValidatedTreeCheckpoint;
+use crate::executor::session::ResponseContinuation;
+use crate::executor::telemetry::ExecutorMetrics;
+use crate::storage::backend::redact_database_urls;
+use crate::storage::schema::verify_persistence_ready;
+use crate::storage::{
+    ConversationStore, DatabaseBackend, ResponseCheckpoint, ResponseStore, create_pool_with_schema_and_configs,
+};
+use crate::tool::{GatewayExecutorRegistration, GatewayExecutors, file_search::FileSearchService};
+use crate::types::io::{InOutItem, ToolChoice};
+use crate::types::messages::GatewayToolMap;
+use crate::types::request_response::{RequestPayload, ResponsePayload};
+
+/// Env var configuring client-tool → gateway-executor aliases for `/v1/messages`
+/// (e.g. `WebSearch=web_search`). Empty/unset means no aliases — client
+/// functions stay client-owned (the ownership doctrine's default).
+const GATEWAY_TOOL_ALIASES_ENV: &str = "MESSAGES_GATEWAY_TOOL_ALIASES";
+
+/// Context built by `rehydrate_conversation`, threaded through the execute pipeline.
+#[derive(Debug)]
+pub struct RequestContext {
+    /// Private canonical tree for stored or connection-local continuation.
+    pub multi_agent_tree: Option<ValidatedTreeCheckpoint>,
+    /// Client request. Before relaxing the inference selector, an omitted `tool_choice`
+    /// is filled with its resolved value so public response metadata stays consistent.
+    pub original_request: RequestPayload,
+    /// Enriched request with rehydrated conversation history injected into `.input`.
+    /// This is the request forwarded to the LLM.
+    pub enriched_request: RequestPayload,
+    /// This turn's input items and model-facing file-search context for persistence. An in-turn compaction can replace
+    /// them with its window; persistence then appends the turn's public output.
+    pub new_input_items: Vec<InOutItem>,
+    /// Our generated response ID (uuid7 with "resp_" prefix).
+    pub response_id: String,
+    /// Resolved conversation ID. `None` when `store=false` or non-conversational.
+    pub conversation_id: Option<String>,
+    /// The turn this request continues (a stored response, a conversation's latest turn, or a session parent), as
+    /// rehydration read it: its metadata and stored history, which persistence extends.
+    pub checkpoint: Option<ResponseCheckpoint>,
+    /// Optional transient-session lease and canonical parent snapshot. Never serialized.
+    pub continuation: Option<ResponseContinuation>,
+}
+
+impl RequestContext {
+    /// Submitted or inherited selector for public metadata and continuation settings.
+    /// The enriched selector is only a fallback before any inference override.
+    pub(super) fn public_tool_choice(&self) -> Option<&ToolChoice> {
+        self.original_request
+            .tool_choice
+            .as_ref()
+            .or(self.enriched_request.tool_choice.as_ref())
+    }
+
+    /// Allow a follow-up inference to finish after tool execution, retaining the
+    /// submitted or inherited selector on the public request.
+    pub(super) fn relax_tool_choice(&mut self) {
+        let tool_choice = self.enriched_request.tool_choice.replace(ToolChoice::Auto);
+        if self.original_request.tool_choice.is_none() {
+            self.original_request.tool_choice = tool_choice;
+        }
+    }
+
+    /// The request's `max_tool_calls` limit. Admission already rejected an
+    /// invalid value, so `None` means the request set no limit.
+    #[must_use]
+    pub fn max_tool_calls(&self) -> Option<NonZeroU64> {
+        self.original_request.max_tool_calls_limit().ok().flatten()
+    }
+
+    /// Inject our `response_id` and `conversation` into a `ResponsePayload`
+    /// received from the LLM (which carries the upstream's own IDs).
+    pub(crate) fn inject_ids(&self, payload: &mut ResponsePayload) {
+        payload.id.clone_from(&self.response_id);
+        payload.conversation.clone_from(&self.conversation_id);
+        payload
+            .previous_response_id
+            .clone_from(&self.original_request.previous_response_id);
+        payload.max_tool_calls = self.max_tool_calls().map(NonZeroU64::get);
+        payload.standard_fields.apply_request(&self.original_request);
+        payload.standard_fields.completed_at = (payload.status == "completed").then(crate::utils::common::utcnow_str);
+    }
+}
+
+/// Runtime dependencies passed into `execute()`.
+///
+/// Owns the storage handlers, HTTP client, and LLM endpoint configuration.
+/// Per-request auth is supplied via [`crate::executor::engine::ExecuteRequest::with_auth`]
+/// rather than stored here, keeping this context purely shared and immutable.
+#[derive(Clone, Debug)]
+pub struct ExecutionContext {
+    /// Shared in-tree file ingestion and retrieval, available when persistence is configured.
+    pub file_search: Option<FileSearchService>,
+    pub conv_handler: ConversationHandler,
+    pub resp_handler: ResponseHandler,
+    pub client: Arc<reqwest::Client>,
+    pub gateway_executors: GatewayExecutors,
+    /// Client-tool → gateway-executor aliases for the `/v1/messages` loop
+    /// (e.g. Claude Code's `WebSearch` → `web_search`). Empty unless configured.
+    pub messages_gateway_tools: GatewayToolMap,
+    /// The operator's key for search results returned to Messages clients;
+    /// without one, a key generated once per process is used.
+    messages_result_key: Option<Arc<MessagesResultKey>>,
+    /// Durable Anthropic message threads, independent of Responses objects.
+    pub messages_threads: MessagesThreadStore,
+    /// Base URL for the LLM backend, e.g. `"http://localhost:8000"`.
+    pub llm_base_url: String,
+    /// Maximum wait for the next body chunk in a streaming request, including HTTP error bodies.
+    /// Applies after response headers arrive; `Duration::ZERO` disables the timeout.
+    /// Sourced from the `STREAMING_CHUNK_TIMEOUT_S` environment variable, defaulting to
+    /// [`DEFAULT_STREAMING_TIMEOUT`] when unset or unparseable.
+    pub streaming_timeout: Duration,
+    /// Bounded-concurrency policy applied to gateway-owned calls in each round.
+    pub(crate) gateway_scheduler_policy: GatewaySchedulerPolicy,
+    pub responses_config: ResponsesConfig,
+    /// Execution, stage, token, and timing instruments. Defaults to the
+    /// globally registered meter provider at construction time.
+    pub metrics: ExecutorMetrics,
+    storage_pool: Option<Arc<crate::storage::DbPool>>,
+}
+
+impl ExecutionContext {
+    /// Returns the full URL for the `/v1/responses` endpoint.
+    #[must_use]
+    pub fn responses_url(&self) -> String {
+        format!("{}/v1/responses", self.llm_base_url)
+    }
+
+    #[must_use]
+    pub fn new(
+        conv_handler: ConversationHandler,
+        resp_handler: ResponseHandler,
+        client: Arc<reqwest::Client>,
+        llm_base_url: String,
+    ) -> Self {
+        let gateway_executors = GatewayExecutors::from_env(Arc::clone(&client));
+        Self {
+            file_search: None,
+            conv_handler,
+            resp_handler,
+            client,
+            gateway_executors,
+            messages_gateway_tools: messages_gateway_tools_from_env(),
+            messages_result_key: None,
+            messages_threads: MessagesThreadStore::default(),
+            llm_base_url,
+            streaming_timeout: streaming_timeout_from_env(),
+            gateway_scheduler_policy: GatewaySchedulerPolicy::default(),
+            responses_config: ResponsesConfig::default(),
+            metrics: ExecutorMetrics::from_global(),
+            storage_pool: None,
+        }
+    }
+
+    /// Record executor metrics with instruments from the embedding
+    /// application's meter instead of the global provider.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: ExecutorMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_responses_config(mut self, responses_config: ResponsesConfig) -> Self {
+        self.responses_config = responses_config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_gateway_executor(mut self, executor: impl Into<GatewayExecutorRegistration>) -> Self {
+        self.gateway_executors.insert(executor);
+        self
+    }
+
+    /// Installs one file search service for both the Files API and the
+    /// gateway-executed built-in tool.
+    #[must_use]
+    pub fn with_file_search_service(mut self, service: FileSearchService) -> Self {
+        self.gateway_executors
+            .insert(GatewayExecutorRegistration::FileSearch(Arc::new(
+                crate::tool::file_search::FileSearchHandler::new(service.clone()),
+            )));
+        self.file_search = Some(service);
+        self
+    }
+
+    /// Seal the search results returned to Messages clients with `key`, so they
+    /// stay readable across restarts and by every replica holding the same key.
+    #[must_use]
+    pub fn with_messages_result_key(mut self, key: MessagesResultKey) -> Self {
+        self.messages_result_key = Some(Arc::new(key));
+        self
+    }
+
+    /// The key that seals and opens search results returned to Messages clients.
+    ///
+    /// # Errors
+    /// Returns an error when no key is configured and the system random number
+    /// generator cannot provide one.
+    pub fn messages_result_key(&self) -> ExecutorResult<&MessagesResultKey> {
+        match &self.messages_result_key {
+            Some(key) => Ok(key),
+            None => process_result_key().map_err(|error| ExecutorError::StreamError(error.to_string())),
+        }
+    }
+
+    /// Checks whether configured persistence can execute a bounded query.
+    pub async fn storage_ready(&self, timeout: Duration) -> bool {
+        let Some(pool) = &self.storage_pool else {
+            return true;
+        };
+        matches!(
+            tokio::time::timeout(timeout, verify_persistence_ready(pool.as_ref())).await,
+            Ok(Ok(()))
+        )
+    }
+
+    /// Returns the configured persistence pool, if storage is enabled.
+    #[must_use]
+    pub fn storage_pool(&self) -> Option<&crate::storage::DbPool> {
+        self.storage_pool.as_deref()
+    }
+
+    /// Build an `ExecutionContext` directly from [`Config`](crate::config::Config).
+    ///
+    /// Creates the database pool, both storage handlers, and an HTTP client
+    /// internally so callers don't need to depend on the storage layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database pool cannot be opened or the schema
+    /// migration fails.
+    pub async fn from_config(cfg: &Config) -> Result<Self, Error> {
+        let default_db_url = cfg.db_url.is_none().then(default_database_url).transpose()?;
+        let db_url = cfg
+            .db_url
+            .as_deref()
+            .or(default_db_url.as_deref())
+            .ok_or_else(|| Error::Config("default database URL was not resolved".to_owned()))?;
+        let database_backend = DatabaseBackend::from_url(db_url)
+            .map_err(|error| Error::Config(format!("invalid DATABASE_URL: {error}")))?;
+        // Only the default database in the Agentic API home is recreated when it holds data from an earlier release;
+        // a configured URL is never recreated, even one naming the same file.
+        let sqlite = SqliteConfig {
+            recreate_outdated_schema: default_db_url.is_some(),
+            ..cfg.sqlite
+        };
+        let pool = create_pool_with_schema_and_configs(Some(db_url), sqlite, cfg.postgres)
+            .await
+            .map_err(|error| database_open_error(database_backend, &error))?;
+        crate::storage::schema::verify_persistence_writable(pool.as_ref())
+            .await
+            .map_err(|error| database_open_error(database_backend, &error))?;
+        let messages_threads = MessagesThreadStore::new(Arc::clone(&pool));
+
+        let conv_handler = ConversationHandler::new(ConversationStore::new(pool.clone()));
+        let resp_handler = ResponseHandler::new(ResponseStore::new(pool.clone()));
+        let client = Arc::new(reqwest::Client::new());
+        let gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
+            .map_err(|error| Error::Config(format!("failed to validate configured gateway tool policies: {error}")))?;
+        let file_search =
+            FileSearchService::configured(Arc::clone(&pool), Arc::clone(&client), cfg.tools.file_search.clone())
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        error = ?error,
+                        sqlite_vec_extension_path = ?cfg.tools.file_search.sqlite_vec_extension_path,
+                        "file search initialization failed"
+                    );
+                    Error::Config(error.public_message())
+                })?;
+        if let Err(error) = file_search.reconcile_blob_cleanup().await {
+            tracing::warn!(%error, "file blob reconciliation will retry while the gateway runs");
+        }
+        Ok(Self {
+            file_search: None,
+            conv_handler,
+            resp_handler,
+            client,
+            gateway_executors,
+            messages_gateway_tools: std::env::var(GATEWAY_TOOL_ALIASES_ENV)
+                .ok()
+                .as_deref()
+                .or(cfg.tools.messages_gateway_tool_aliases.as_deref())
+                .map(GatewayToolMap::from_env_str)
+                .unwrap_or_default(),
+            messages_result_key: MessagesResultKey::from_env()
+                .map_err(|error| Error::Config(error.to_string()))?
+                .map(Arc::new),
+            llm_base_url: cfg.llm_api_base.clone(),
+            messages_threads,
+            streaming_timeout: streaming_timeout_from_env(),
+            gateway_scheduler_policy: GatewaySchedulerPolicy::new(cfg.tools.max_concurrent_gateway_calls),
+            responses_config: cfg.responses,
+            metrics: ExecutorMetrics::from_global(),
+            storage_pool: Some(pool),
+        }
+        .with_file_search_service(file_search))
+    }
+}
+
+/// Default streaming chunk timeout when `STREAMING_CHUNK_TIMEOUT_S` is unset or
+/// unparseable. Generous to accommodate long-prefill / high-TTFT workloads.
+pub const DEFAULT_STREAMING_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn streaming_timeout_from_env() -> Duration {
+    parse_streaming_timeout(std::env::var("STREAMING_CHUNK_TIMEOUT_S").ok().as_deref())
+}
+
+/// Parse a `STREAMING_CHUNK_TIMEOUT_S` value into a chunk timeout.
+///
+/// Falls back to [`DEFAULT_STREAMING_TIMEOUT`] when the value is absent or not a
+/// valid non-negative integer. A value of `0` yields `Duration::ZERO`, which
+/// disables the per-chunk timeout.
+fn parse_streaming_timeout(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(DEFAULT_STREAMING_TIMEOUT, Duration::from_secs)
+}
+
+fn database_open_error(database_backend: DatabaseBackend, error: &sqlx::Error) -> Error {
+    let category = match error {
+        sqlx::Error::Configuration(_) | sqlx::Error::InvalidArgument(_) => "configuration error".to_owned(),
+        sqlx::Error::Database(database_error) => database_error
+            .code()
+            .filter(|code| code.len() <= 5 && code.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+            .map_or_else(
+                || "database error".to_owned(),
+                |code| format!("database error (SQLSTATE {code})"),
+            ),
+        sqlx::Error::Io(_) => "database I/O error".to_owned(),
+        sqlx::Error::Tls(_) => "database TLS error".to_owned(),
+        sqlx::Error::Protocol(_) => "database protocol error".to_owned(),
+        sqlx::Error::PoolTimedOut => "connection pool timeout".to_owned(),
+        sqlx::Error::PoolClosed => "connection pool closed".to_owned(),
+        sqlx::Error::WorkerCrashed => "database worker crashed".to_owned(),
+        sqlx::Error::Migrate(_) => "database migration error".to_owned(),
+        _ => "database error".to_owned(),
+    };
+    let detail = redact_database_urls(&error.to_string());
+    Error::Config(format!(
+        "failed to open {} database: {category}: {detail}",
+        database_backend.display_name()
+    ))
+}
+
+/// Load the `/v1/messages` gateway-tool alias map from the environment.
+fn messages_gateway_tools_from_env() -> GatewayToolMap {
+    std::env::var(GATEWAY_TOOL_ALIASES_ENV)
+        .ok()
+        .map(|raw| GatewayToolMap::from_env_str(&raw))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{DEFAULT_STREAMING_TIMEOUT, ExecutionContext, database_open_error, parse_streaming_timeout};
+    use crate::executor::messages_threads::MessagesThreadStore;
+    use crate::executor::{ConversationHandler, ResponseHandler};
+    use crate::storage::{ConversationStore, DatabaseBackend, ResponseStore, create_pool_with_schema};
+
+    #[test]
+    fn streaming_timeout_parsing_covers_unset_invalid_zero_and_valid() {
+        // Unset falls back to the default.
+        assert_eq!(parse_streaming_timeout(None), DEFAULT_STREAMING_TIMEOUT);
+        // Non-numeric and negative values are unparseable → default.
+        assert_eq!(parse_streaming_timeout(Some("")), DEFAULT_STREAMING_TIMEOUT);
+        assert_eq!(parse_streaming_timeout(Some("abc")), DEFAULT_STREAMING_TIMEOUT);
+        assert_eq!(parse_streaming_timeout(Some("-1")), DEFAULT_STREAMING_TIMEOUT);
+        // `0` disables the timeout.
+        assert_eq!(parse_streaming_timeout(Some("0")), Duration::ZERO);
+        // A valid value is honored.
+        assert_eq!(parse_streaming_timeout(Some("30")), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn database_errors_are_actionable_without_exposing_credentials() {
+        let database_url = "postgresql://agentic-api:super'secret@postgres.example.com/agentic_api";
+        let backend = DatabaseBackend::from_url(database_url).expect("valid PostgreSQL URL");
+        let tls_error = sqlx::Error::Tls(Box::new(std::io::Error::other(format!(
+            "{database_url} certificate verify failed"
+        ))));
+        let pool_error = sqlx::Error::PoolTimedOut;
+        let tls_message = database_open_error(backend, &tls_error).to_string();
+        let pool_message = database_open_error(backend, &pool_error).to_string();
+
+        assert!(tls_message.contains("database TLS error"));
+        assert!(tls_message.contains("certificate verify failed"));
+        assert!(tls_message.contains("postgresql://[redacted]"));
+        assert_eq!(
+            pool_message,
+            "failed to open PostgreSQL database: connection pool timeout: \
+             pool timed out while waiting for an open connection"
+        );
+        assert!(!tls_message.contains("super-secret"));
+        assert!(!tls_message.contains("secret"));
+        assert!(!tls_message.contains("agentic-api"));
+        assert_ne!(tls_message, pool_message);
+
+        let mysql_error = sqlx::Error::Io(std::io::Error::other(
+            "mysql://gateway:mysql-secret@mysql.example.com/agentic_api refused",
+        ));
+        let mysql_message = database_open_error(DatabaseBackend::Other, &mysql_error).to_string();
+        assert!(mysql_message.contains("mysql://[redacted]"));
+        assert!(!mysql_message.contains("mysql-secret"));
+
+        let short_postgres_url = "postgres://gateway:postgres-secret@postgres.example.com/agentic_api";
+        let short_postgres_error = sqlx::Error::Io(std::io::Error::other(format!("{short_postgres_url} refused")));
+        let short_postgres_backend = DatabaseBackend::from_url(short_postgres_url).expect("valid PostgreSQL URL");
+        let short_postgres_message = database_open_error(short_postgres_backend, &short_postgres_error).to_string();
+        assert!(short_postgres_message.contains("failed to open PostgreSQL database"));
+        assert!(short_postgres_message.contains("postgres://[redacted]"));
+        assert!(!short_postgres_message.contains("postgres-secret"));
+    }
+
+    #[test]
+    fn uppercase_database_urls_are_classified_and_redacted() {
+        let database_url = "POSTGRESQL://gateway:postgres-secret@postgres.example.com/agentic_api";
+        let error = sqlx::Error::Io(std::io::Error::other(format!("{database_url} refused")));
+        let backend = DatabaseBackend::from_url(database_url).expect("valid uppercase PostgreSQL URL");
+        let message = database_open_error(backend, &error).to_string();
+
+        assert!(message.contains("failed to open PostgreSQL database"));
+        assert!(message.contains("postgresql://[redacted]"));
+        assert!(!message.contains("postgres-secret"));
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_is_bounded_by_the_probe_timeout() {
+        let pool = create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create single-connection pool");
+        let held_connection = pool.acquire().await.expect("hold the only connection");
+        let mut context = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::new()),
+            "http://localhost:8000".to_owned(),
+        );
+        context.messages_threads = MessagesThreadStore::new(Arc::clone(&pool));
+        context.storage_pool = Some(pool.clone());
+
+        assert!(!context.storage_ready(Duration::from_millis(10)).await);
+        drop(held_connection);
+        assert!(context.storage_ready(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_rejects_missing_persistence_tables() {
+        let pool = create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create persistence pool");
+        let mut context = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::new()),
+            "http://localhost:8000".to_owned(),
+        );
+        context.messages_threads = MessagesThreadStore::new(Arc::clone(&pool));
+        context.storage_pool = Some(pool.clone());
+        assert!(context.storage_ready(Duration::from_secs(1)).await);
+
+        sqlx::query("DROP TABLE responses")
+            .execute(pool.as_ref())
+            .await
+            .expect("drop persistence table");
+
+        assert!(!context.storage_ready(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_rejects_read_only_persistence() {
+        let pool = create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create persistence pool");
+        let mut context = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::new()),
+            "http://localhost:8000".to_owned(),
+        );
+        context.messages_threads = MessagesThreadStore::new(Arc::clone(&pool));
+        context.storage_pool = Some(pool.clone());
+        assert!(context.storage_ready(Duration::from_secs(1)).await);
+
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(pool.as_ref())
+            .await
+            .expect("make persistence read-only");
+
+        assert!(!context.storage_ready(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_rolls_back_probe_rows() {
+        let pool = create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create persistence pool");
+
+        crate::storage::schema::verify_persistence_writable(pool.as_ref())
+            .await
+            .expect("run functional persistence probe");
+        for table in ["conversations", "items", "responses"] {
+            let row_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("count persistence rows");
+            assert_eq!(row_count, 0, "readiness probe leaked a row into {table}");
+        }
+    }
+}

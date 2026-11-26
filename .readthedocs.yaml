@@ -1,0 +1,23 @@
+# Read the Docs configuration file for Agentic API
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+version: 2
+
+mkdocs:
+  configuration: mkdocs.yaml
+  fail_on_warning: true
+
+build:
+  os: ubuntu-22.04
+  tools:
+    python: "3.12"
+    rust: "1.98.0"
+  jobs:
+    post_checkout:
+      - git fetch --unshallow origin main --no-tags
+    pre_create_environment:
+      - pip install uv
+    create_environment:
+      - uv venv $READTHEDOCS_VIRTUALENV_PATH
+    install:
+      - uv pip install -r docs/requirements.txt

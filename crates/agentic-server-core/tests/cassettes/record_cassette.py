@@ -1,0 +1,3097 @@
+"""
+Interactive multi-turn cassette recorder.
+
+Starts an embedded recording proxy between this script and the upstream API,
+then drives multi-turn conversations so every request/response is captured
+into a YAML cassette.
+
+Wiring:
+
+  [this script] → [embedded proxy:<proxy-port>] → [OpenAI API | vLLM | gateway]
+                   (cassette recorded here)
+
+Modes:
+  conv        (default) Creates a conversation via POST /v1/conversations, then
+              passes conversation id on every turn.
+  isolation   Two independent conversations (each with its own conversation id)
+              recorded into the same cassette.
+  mixed       Creates a conversation; turn 1 uses conversation id, turns 2+
+              switch to previous_response_id only (drops conversation id).
+  responses   No conversation created. Chains turns purely via
+              previous_response_id. Supports --openai, --vllm, and --gateway backends.
+  items       Records flat conversation/item API steps. Select --items-scenario
+              continuation, deletion, branch, pagination, edge-cases, concurrent-writes,
+              stale-compaction, competing-tool-outputs, or overlapping-multi-agent.
+
+Usage:
+    python tests/cassettes/record_cassette.py --turns 2 --no-stream --output path/to/cassette.yaml
+    python tests/cassettes/record_cassette.py --turns 3 --mode isolation --no-stream --output path/to/cassette.yaml
+    python tests/cassettes/record_cassette.py --turns 3 --mode mixed --no-stream --output path/to/cassette.yaml
+    python tests/cassettes/record_cassette.py --turns 3 --mode conv --branch-from 1 --branch-turn-number 2 --no-stream --output path/to/cassette.yaml
+    python tests/cassettes/record_cassette.py --turns 5 --mode conv --branch-from 1 --branch-turn-number 3 --branch-from 2 --branch-turn-number 5 --no-stream --output path/to/cassette.yaml
+    python tests/cassettes/record_cassette.py --turns 2 --mode responses --vllm http://localhost:8000 --model Qwen/Qwen3-30B-A3B-FP8 --no-stream --output path/to/cassette.yaml
+    python tests/cassettes/record_cassette.py --turns 2 --mode responses --transport websocket --vllm http://localhost:3018 --model Qwen/Qwen3.6-35B-A3B --output path/to/ws-cassette.yaml
+    python tests/cassettes/record_cassette.py --turns 2 --mode responses --vllm http://localhost:8000 --model Qwen/Qwen3-30B-A3B-FP8 --max-output-tokens 1024 --no-stream --output path/to/cassette.yaml
+    python tests/cassettes/record_cassette.py --turns 1 --mode responses --gateway http://localhost:9000 --model Qwen/Qwen3-30B-A3B-FP8 --no-stream --output path/to/cassette.yaml
+"""
+
+import base64
+import copy
+import hashlib
+import importlib.util
+import json
+import logging
+import os
+import secrets
+import socket
+import ssl
+import itertools
+import struct
+import sys
+import threading
+import time
+import types
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncGenerator, Callable
+from urllib.parse import urlparse
+
+import click
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
+from httpx import AsyncClient
+from yaml import dump as yaml_dump
+from yaml import safe_load as yaml_load
+
+from replay_old_cassettes import run_multi_agent_store_false, run_tool_items
+
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger("cassette_proxy")
+
+MODEL = "gpt-4o"
+PROXY_HOST = "127.0.0.1"
+PROXY_PORT = 7070
+# A driver that overlaps requests numbers each one in send order; the proxy strips this header.
+RECORDING_TURN_HEADER = "x-recording-turn"
+TIMEOUT = 60 * 5
+HTTP_READ_TIMEOUT = TIMEOUT
+
+EXCLUDED_RESPONSE_HEADERS = {
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "set-cookie",
+}
+
+RECORDED_HEADERS = {
+    "content-type",
+    "authorization",
+    "user-agent",
+    "accept",
+    "x-run-id",
+    "openai-beta",
+}
+
+
+def _mask_authorization(value: str) -> str:
+    if not value:
+        return value
+    lower = value.lower()
+    if lower.startswith("bearer "):
+        return "Bearer ***"
+    return "***"
+
+
+def _filter_request_headers(headers) -> dict:
+    return {
+        k: v if k.lower() != "authorization" else _mask_authorization(v)
+        for k, v in headers.items()
+        if k.lower() in RECORDED_HEADERS
+    }
+
+
+def _filter_response_headers(headers) -> dict:
+    return {
+        k: v for k, v in headers.items() if k.lower() not in EXCLUDED_RESPONSE_HEADERS
+    }
+
+
+def _turn_number(output_file: Path) -> int:
+    if not output_file.exists():
+        return 1
+    content = output_file.read_text(encoding="utf-8")
+    if not content.strip():
+        return 1
+    data = yaml_load(content)
+    if not data or "turns" not in data:
+        return 1
+    return len(data["turns"]) + 1
+
+
+def _append_turn(output_file: Path, turn: dict[str, Any], *, ordered: bool = False) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    if output_file.exists() and output_file.stat().st_size > 0:
+        data = yaml_load(output_file.read_text(encoding="utf-8")) or {}
+    else:
+        data = {}
+    turns: list = data.get("turns", [])
+    turns.append(turn)
+    if ordered:
+        # Driver-numbered requests can complete out of order; keep the file in send order.
+        turns.sort(key=lambda recorded: int(recorded["filename"][1:]))
+    data["turns"] = turns
+    with open(output_file, "w", encoding="utf-8") as f:
+        yaml_dump(data, f, allow_unicode=True, default_flow_style=False)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http_client = AsyncClient(timeout=_http_timeout())
+    yield
+    await app.state.http_client.aclose()
+
+
+proxy_app = FastAPI(lifespan=lifespan)
+
+
+def _http_timeout(*, proxy_client: bool = False) -> httpx.Timeout:
+    # Give the proxy time to capture and report an upstream read timeout
+    # before the client waiting on the proxy reaches its own read timeout.
+    return httpx.Timeout(TIMEOUT, read=HTTP_READ_TIMEOUT + (10 if proxy_client else 0))
+
+
+def _record_transport_error(
+    output_file: Path, turn: dict[str, Any], error: httpx.RequestError
+) -> Response:
+    """Capture a failed upstream exchange without inventing an upstream response."""
+    detail = {"type": type(error).__name__, "message": str(error)}
+    turn["response"]["transport_error"] = detail
+    _append_turn(output_file, turn)
+    message = (
+        f"Recorder proxy could not obtain a complete upstream response: {type(error).__name__}. "
+        f"Transport failure recorded in {output_file}; no upstream HTTP status or body was captured."
+    )
+    print(f"  [{message}]")
+    # This status belongs only to the local proxy. The cassette contains the
+    # transport failure above, not a fabricated OpenAI 502/504 response.
+    return Response(
+        content=json.dumps({"error": {"type": "cassette_proxy_transport_error", "message": message}}),
+        status_code=504 if isinstance(error, httpx.TimeoutException) else 502,
+        media_type="application/json",
+    )
+
+
+@proxy_app.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+)
+async def proxy_request(request: Request, path: str) -> Response:
+    http_client: AsyncClient = request.app.state.http_client
+    target_host: str = request.app.state.target_host
+    output_file: Path = request.app.state.output_file
+
+    sent_turn = request.headers.get(RECORDING_TURN_HEADER)
+    turn_num = getattr(request.state, "recording_turn", None) or (int(sent_turn) if sent_turn else None)
+    if turn_num is None:
+        turn_num = _turn_number(output_file)
+    filename = f"t{turn_num}"
+
+    target_url = f"{target_host}/{path}"
+    if str(request.query_params):
+        target_url += f"?{request.query_params}"
+
+    raw_body = await request.body()
+    parsed_body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+
+    query_params = {}
+    for key in request.query_params:
+        values = request.query_params.getlist(key)
+        query_params[key] = values[0] if len(values) == 1 else values
+    turn: dict[str, Any] = {
+        "filename": filename,
+        "request": {
+            "method": request.method,
+            "path": f"/{path}",
+            "query_params": query_params,
+            "body": parsed_body,
+            "headers": _filter_request_headers(request.headers),
+        },
+        "response": {},
+    }
+
+    forward_headers = {
+        k: v for k, v in request.headers.items() if k.lower() not in {"host", RECORDING_TURN_HEADER}
+    }
+
+    if parsed_body.get("stream", False):
+
+        async def _stream() -> AsyncGenerator[str, None]:
+            async with http_client.stream(
+                method=request.method,
+                url=target_url,
+                headers=forward_headers,
+                content=raw_body,
+                timeout=_http_timeout(),
+            ) as response:
+                yield response  # type: ignore[misc]
+                if response.status_code != 200:
+                    chunk_str = (await response.aread()).decode()
+                    try:
+                        turn["response"]["body"] = json.loads(chunk_str)
+                    except Exception:
+                        turn["response"]["body"] = chunk_str
+                    yield chunk_str
+                else:
+                    sse_events: list[str] = []
+                    try:
+                        async for line in response.aiter_lines():
+                            chunk = f"{line}\n"
+                            yield chunk
+                            sse_events.append(chunk)
+                    except Exception as e:
+                        turn["response"]["stream_error"] = (
+                            f"{e.__class__.__name__}: {e}"
+                        )
+                    finally:
+                        turn["response"]["sse"] = sse_events
+                turn["response"]["status_code"] = response.status_code
+                turn["response"]["headers"] = {
+                    "content-type": response.headers.get(
+                        "content-type", "text/event-stream"
+                    )
+                }
+                _append_turn(output_file, turn, ordered=sent_turn is not None)
+                print(f"  [recorded turn {turn_num} -> {output_file.name}]")
+
+        agen = _stream()
+        try:
+            upstream = await anext(agen)
+        except httpx.RequestError as error:
+            return _record_transport_error(output_file, turn, error)
+        return StreamingResponse(
+            agen,
+            status_code=upstream.status_code,
+            headers=_filter_response_headers(upstream.headers),
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+        )
+
+    else:
+        try:
+            response = await http_client.request(
+                method=request.method,
+                url=target_url,
+                headers=forward_headers,
+                content=raw_body,
+                timeout=_http_timeout(),
+            )
+        except httpx.RequestError as error:
+            return _record_transport_error(output_file, turn, error)
+        media_type = response.headers.get("content-type", "application/json")
+        try:
+            body: Any = response.json()
+        except ValueError:
+            body = response.text
+        turn["response"]["body"] = body
+        turn["response"]["status_code"] = response.status_code
+        turn["response"]["headers"] = {"content-type": media_type}
+        _append_turn(output_file, turn, ordered=sent_turn is not None)
+        print(f"  [recorded turn {turn_num} -> {output_file.name}]")
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=_filter_response_headers(response.headers),
+            media_type=media_type,
+        )
+
+
+# ── proxy lifecycle ───────────────────────────────────────────────────────────
+
+
+def _start_proxy(output_file: Path, target_host: str, port: int, append: bool = False) -> uvicorn.Server:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    if not append or not output_file.exists():
+        output_file.write_text("", encoding="utf-8")
+    proxy_app.state.output_file = output_file
+    proxy_app.state.target_host = target_host
+
+    config = uvicorn.Config(proxy_app, host=PROXY_HOST, port=port, log_level="warning")
+    server = uvicorn.Server(config)
+
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    # TCP-only readiness check — no HTTP request forwarded to upstream
+    for _ in range(40):
+        try:
+            with socket.create_connection((PROXY_HOST, port), timeout=0.3):
+                break
+        except OSError:
+            time.sleep(0.3)
+
+    return server
+
+
+def _stop_proxy(server: uvicorn.Server) -> None:
+    server.should_exit = True
+    time.sleep(0.5)
+
+
+def _create_conversation(client: httpx.Client, proxy_url: str) -> str:
+    resp = client.post(f"{proxy_url}/v1/conversations", json={}, timeout=30)
+    resp.raise_for_status()
+    conv_id = resp.json().get("id")
+    print(f"[conversation created: {conv_id}]")
+    return conv_id
+
+
+def _raise_recording_http_error(response: httpx.Response) -> None:
+    """Show the received error body instead of an opaque localhost traceback."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        detail = response.text[:2000]
+        raise click.ClickException(
+            f"Recording request returned HTTP {response.status_code}.\n{detail}"
+        ) from error
+
+
+def _item_request(
+    client: httpx.Client,
+    proxy_url: str,
+    method: str,
+    path: str,
+    *,
+    body: dict | None = None,
+    params: dict | list[tuple[str, str]] | None = None,
+    headers: dict[str, str] | None = None,
+    expected_status: int | None = 200,
+) -> dict:
+    """Send management requests through the shared recording proxy."""
+    response = client.request(
+        method, f"{proxy_url}{path}", json=body, params=params, headers=headers,
+        timeout=_http_timeout(proxy_client=True),
+    )
+    if expected_status is not None and response.status_code != expected_status:
+        raise RuntimeError(
+            f"{method} {path}: expected {expected_status}, got {response.status_code}: "
+            f"{response.text[:1000]}"
+        )
+    return response.json()
+
+
+def _item_response(
+    client: httpx.Client,
+    proxy_url: str,
+    model: str,
+    prompt: str,
+    *,
+    conversation: str | None = None,
+    previous_response_id: str | None = None,
+    stream: bool = False,
+    store: bool = True,
+    during: Callable[[], None] | None = None,
+) -> dict:
+    if conversation and previous_response_id:
+        raise ValueError("conversation and previous_response_id are mutually exclusive")
+    body: dict[str, Any] = {
+        "model": model,
+        "input": [{"role": "user", "content": prompt}],
+        "store": store,
+        "stream": stream,
+    }
+    if conversation:
+        body["conversation"] = conversation
+    if previous_response_id:
+        body["previous_response_id"] = previous_response_id
+    result = (
+        _send_streaming(client, body, proxy_url, during)
+        if stream
+        else _send_nonstreaming(client, body, proxy_url)
+    )
+    if not result or not result.get("id"):
+        raise RuntimeError("Responses call returned no response ID")
+    return result
+
+
+def _record_duplicate_items(
+    client: httpx.Client, proxy_url: str, source_items_path: str, item_id: str
+) -> None:
+    """Probe generated-ID reuse and duplication without assuming acceptance."""
+    first = {"type": "message", "id": item_id, "role": "user",
+             "content": "Duplicate ID probe: first copy."}
+    second = {**first, "content": "Duplicate ID probe: second copy."}
+    # A single-copy control distinguishes rejection of cross-conversation ID
+    # reuse from rejection caused specifically by duplicates within a request.
+    for items in ([first], [first, second]):
+        conversation = _create_conversation(client, proxy_url)
+        items_path = f"/v1/conversations/{conversation}/items"
+        _item_request(client, proxy_url, "POST", items_path,
+                      body={"items": items}, expected_status=None)
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+    _item_request(client, proxy_url, "POST", source_items_path,
+                  body={"items": [first]}, expected_status=None)
+    _item_request(client, proxy_url, "GET", source_items_path, params={"order": "asc"})
+
+
+def _record_concurrent_writes(client: httpx.Client, proxy_url: str, model: str) -> None:
+    """Change a conversation while its streamed turn B runs, once per case on a fresh conversation.
+
+    Each side request runs after B's first output text delta. Requests are numbered in send order, so B
+    precedes its side request in every recording even though the side request completes first.
+    """
+    _number_requests_in_send_order(client)
+
+    def request(method: str, path: str, **kwargs: Any) -> dict:
+        return _item_request(client, proxy_url, method, path, **kwargs)
+
+    def turn(conversation: str, prompt: str, during: Callable[[], None] | None = None) -> dict:
+        return _item_response(client, proxy_url, model, prompt, conversation=conversation,
+                              stream=during is not None, during=during)
+
+    ascending = {"order": "asc"}
+    for case in ("add-item", "delete-item", "delete-response"):
+        conversation = _create_conversation(client, proxy_url)
+        items_path = f"/v1/conversations/{conversation}/items"
+        first = turn(conversation, "Remember the word APRICOT. Reply with only OK.")
+        if case == "add-item":
+            side_item = {"type": "message", "role": "user", "content": "Side note: the marker is VIOLET."}
+            during = lambda: request("POST", items_path, body={"items": [side_item]})
+        elif case == "delete-item":
+            first_item = request("GET", items_path, params={"order": "asc", "limit": 1})["data"][0]["id"]
+            during = lambda: request("DELETE", f"{items_path}/{first_item}")
+        else:
+            during = lambda: request("DELETE", f"/v1/responses/{first['id']}")
+        streamed = turn(conversation, "Count from 1 to 120, one number per line, digits only.", during)
+        request("GET", f"/v1/responses/{streamed['id']}/input_items", params=ascending)
+        request("GET", items_path, params=ascending)
+        if case == "delete-response":
+            follow_up = turn(conversation, "What word did I ask you to remember? Reply with only that word.")
+            request("GET", f"/v1/responses/{follow_up['id']}/input_items", params=ascending)
+            request("GET", f"/v1/responses/{first['id']}", expected_status=None)
+
+
+def _number_requests_in_send_order(client: httpx.Client) -> None:
+    """Number turns in send order, so a streamed turn precedes the side request sent while it streams."""
+    sequence = itertools.count(1)
+    client.event_hooks["request"].append(
+        lambda sent: sent.headers.__setitem__(RECORDING_TURN_HEADER, str(next(sequence)))
+    )
+
+
+def _observed_turn(
+    client: httpx.Client, proxy_url: str, body: dict, during: Callable[[], None] | None = None
+) -> dict:
+    """Send a Responses call and return its terminal response or error body, so a rejected turn is recorded.
+
+    A streamed call runs `during` once, after its first output text delta; its result keeps the ID from
+    `response.created` even when the stream ends in an error event.
+    """
+    timeout = _http_timeout(proxy_client=True)
+    if not body.get("stream"):
+        result = client.post(f"{proxy_url}/v1/responses", json=body, timeout=timeout).json()
+        print(f"\n[Response]\n{json.dumps(result, indent=2)}\n")
+        return result
+    result: dict = {}
+    created_id = None
+    with client.stream("POST", f"{proxy_url}/v1/responses", json=body, timeout=timeout) as resp:
+        if resp.status_code != 200:
+            return json.loads(resp.read())
+        for line in resp.iter_lines():
+            if not line.startswith("data:") or line == "data: [DONE]":
+                continue
+            print(line)
+            event = json.loads(line[5:].strip())
+            kind = event.get("type")
+            if kind == "response.created":
+                created_id = event["response"]["id"]
+            elif kind in ("response.completed", "response.failed", "response.incomplete"):
+                result = event["response"]
+            elif kind == "error":
+                result = event
+            if during and kind == "response.output_text.delta":
+                during, run = None, during
+                run()
+    if during:
+        raise RuntimeError("stream ended before the first output text delta")
+    if created_id:
+        result.setdefault("id", created_id)
+    return result
+
+
+def _input_items_or_conversation(request: Callable[..., dict], response: dict, items_path: str) -> dict:
+    """List a turn's input items, or the conversation's items when the turn was rejected without an ID."""
+    path = f"/v1/responses/{response['id']}/input_items" if response.get("id") else items_path
+    return request("GET", path, params={"order": "asc"})
+
+
+WEATHER_TOOL = {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Get the current temperature for a city.",
+    "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
+def _record_stale_compaction(client: httpx.Client, proxy_url: str, model: str) -> None:
+    """Commit a plain turn C while streamed turn B compacts the history it rehydrated before C.
+
+    B's summary cannot include C's reply (VIOLET). D then asks for that reply, showing whether it survives in
+    the history a later turn sees. t10 probes whether explicit compaction accepts a conversation.
+    """
+    _number_requests_in_send_order(client)
+    conversation = _create_conversation(client, proxy_url)
+    items_path = f"/v1/conversations/{conversation}/items"
+    ascending = {"order": "asc"}
+
+    def turn(prompt: str, during: Callable[[], None] | None = None, **extra: Any) -> dict:
+        body = {"model": model, "conversation": conversation, "store": True, "stream": during is not None,
+                "input": [{"role": "user", "content": prompt}], **extra}
+        return _observed_turn(client, proxy_url, body, during)
+
+    def request(method: str, path: str, **kwargs: Any) -> dict:
+        return _item_request(client, proxy_url, method, path, expected_status=None, **kwargs)
+
+    # Enough history for a 1,000-token threshold under both OpenAI's tokenizer and the gateway's estimate.
+    turn("Background notes for later. " * 450 + "Remember the word APRICOT. Reply with only OK.")
+    side: dict = {}
+    streamed = turn(
+        "Count from 1 to 120, one number per line, digits only.",
+        lambda: side.update(turn("Reply with only the word VIOLET.")),
+        context_management=[{"type": "compaction", "compact_threshold": 1000}],
+    )
+    request("GET", items_path, params=ascending)
+    inputs = lambda response: _input_items_or_conversation(request, response, items_path)
+    inputs(streamed)
+    inputs(side)
+    inputs(turn("Earlier in this conversation you replied with a single color word. "
+                "Reply with only that word, or NONE if you cannot see it."))
+    request("POST", "/v1/responses/compact", body={"model": model, "conversation": conversation})
+
+
+
+# Enough history for a 1,000-token threshold under both OpenAI's tokenizer and the gateway's estimate.
+COMPACTION_NOTES = "Background notes for later. " * 450 + "Remember the word APRICOT. Reply with only OK."
+COMPACTION_THRESHOLD = [{"type": "compaction", "compact_threshold": 1000}]
+RECALL_PROMPT = "What word did I ask you to remember? Reply with only that word, or NONE if you cannot see it."
+
+
+def _record_checkpoint_replay(client: httpx.Client, proxy_url: str, model: str, checkpoint: dict) -> None:
+    """A client sends a compaction checkpoint back as input: a stored turn sends `checkpoint`'s output back, then its
+    input items, a `previous_response_id` continuation asking for the remembered word, and that turn's input items."""
+    def input_items(response: dict) -> None:
+        _item_request(client, proxy_url, "GET", f"/v1/responses/{response['id']}/input_items",
+                      params={"order": "asc"}, expected_status=None)
+
+    replayed = _observed_turn(client, proxy_url, {
+        "model": model, "store": True, "stream": False,
+        "input": checkpoint["output"] + [{"role": "user", "content": "Reply only OK."}],
+    })
+    input_items(replayed)
+    continued = _observed_turn(client, proxy_url, {
+        "model": model, "store": True, "stream": False, "previous_response_id": replayed["id"],
+        "input": RECALL_PROMPT,
+    })
+    input_items(continued)
+
+
+def _record_compaction_in_turn_chain(client: httpx.Client, proxy_url: str, model: str, stream: bool) -> None:
+    """A `previous_response_id` chain whose turn B passes the compaction threshold.
+
+    B (t2, streamed when recording with --stream) shows where the compaction items sit in its output; its input items
+    (t3) show what it stored; C (t4) continues B, and its input items (t5) show where a later turn's history starts.
+    t6–t9 send B's stored compaction back as input ([`_record_checkpoint_replay`]).
+    """
+    def turn(prompt: str, previous: str | None = None, **extra: Any) -> dict:
+        body = {"model": model, "store": True, "stream": False, "input": prompt, **extra}
+        if previous:
+            body["previous_response_id"] = previous
+        return _observed_turn(client, proxy_url, body)
+
+    def input_items(response: dict) -> dict:
+        return _item_request(client, proxy_url, "GET", f"/v1/responses/{response['id']}/input_items",
+                             params={"order": "asc"}, expected_status=None)
+
+    first = turn(COMPACTION_NOTES)
+    compacting = turn("Count from 1 to 60, one number per line, digits only.", first["id"],
+                      stream=stream, context_management=COMPACTION_THRESHOLD)
+    input_items(compacting)
+    follow_up = turn(RECALL_PROMPT, compacting["id"], context_management=COMPACTION_THRESHOLD)
+    input_items(follow_up)
+    _record_checkpoint_replay(client, proxy_url, model, compacting)
+
+
+def _record_compaction_tool_loop(client: httpx.Client, proxy_url: str, model: str, stream: bool) -> None:
+    """Compaction around a client function call: B (t2) calls get_weather after compacting, and C (t3) answers the
+    call while the history still passes the threshold. C's input items (t4) show the call and output kept.
+    An async call (t5) remains pending across compaction (t6) and another turn (t7). Inspect that turn's input (t8),
+    then submit the result late (t9) and on a separate branch immediately after compaction (t10)."""
+    def turn(input_value: Any, previous: str, **extra: Any) -> dict:
+        body = {"model": model, "store": True, "stream": stream, "input": input_value, "previous_response_id": previous,
+                "tools": [WEATHER_TOOL], "parallel_tool_calls": False, "context_management": COMPACTION_THRESHOLD,
+                **extra}
+        return _observed_turn(client, proxy_url, body)
+
+    first = _observed_turn(client, proxy_url, {"model": model, "store": True, "input": COMPACTION_NOTES})
+    calling = turn("What is the weather in Paris? Use the get_weather tool.", first["id"], tool_choice="required")
+    call = next((item for item in calling.get("output", []) if item.get("type") == "function_call"), None)
+    if call is None:
+        raise RuntimeError(f"turn B made no get_weather call: {calling}")
+    answered = turn([{"type": "function_call_output", "call_id": call["call_id"], "output": "18 degrees and sunny"}],
+                    calling["id"], tool_choice="none")
+    _item_request(client, proxy_url, "GET", f"/v1/responses/{answered['id']}/input_items",
+                  params={"order": "asc"}, expected_status=None)
+
+    fixtures = Path(__file__).parent / "async_tools"
+    prompts = json.loads((fixtures / "prompts.json").read_text())
+    async_request = {
+        "model": model, "store": True, "stream": False, "max_output_tokens": 8192,
+        "tools": json.loads((fixtures / "tools.json").read_text())["weather_async"],
+    }
+    pending = _observed_turn(client, proxy_url, {
+        **async_request, "input": prompts["weather_start"], "instructions": prompts["instructions"]["weather"],
+    })
+    async_calls = [item for item in pending.get("output", []) if item.get("type") == "function_call"
+                   and item.get("name") == "get_weather" and item.get("async") is True]
+    if pending.get("status") != "completed" or len(async_calls) != 1:
+        raise RuntimeError("async compaction requires one completed response with an async weather call")
+    compacting = _observed_turn(client, proxy_url, {
+        **async_request, "previous_response_id": pending["id"], "context_management": COMPACTION_THRESHOLD,
+        "input": COMPACTION_NOTES + " Do not call any tools. The weather lookup is still running; reply only OK.",
+    })
+    if compacting.get("status") != "completed" or not any(
+        item.get("type") == "compaction" for item in compacting.get("output", [])
+    ):
+        raise RuntimeError("the pending async call's follow-up did not complete compaction")
+    continued = _observed_turn(client, proxy_url, {
+        **async_request, "previous_response_id": compacting["id"],
+        "input": "The weather result is still pending. Do not call any tools. Reply only WAITING.",
+    })
+    if continued.get("status") != "completed":
+        raise RuntimeError("continuation after compaction did not complete")
+    _item_request(client, proxy_url, "GET", f"/v1/responses/{continued['id']}/input_items",
+                  params={"order": "asc"})
+    result = [
+        {"type": "function_call_output", "call_id": async_calls[0]["call_id"], "output": prompts["weather_output"]},
+        {"type": "message", "role": "user", "content": prompts["weather_ask"]},
+    ]
+    for previous in [continued["id"], compacting["id"]]:
+        # Record rejection as evidence too; do not turn the current gateway behavior into an expectation.
+        _observed_turn(client, proxy_url, {**async_request, "previous_response_id": previous, "input": result})
+
+
+def _record_compaction_standalone(client: httpx.Client, proxy_url: str, model: str, stream: bool) -> None:
+    """`/v1/responses/compact` with input (t1), a turn continuing its window (t2), with `previous_response_id` (t4,
+    after the stored turn t3), and with neither (t5). t6–t12 follow a retained image through three stored turns."""
+    def compact(body: dict) -> dict:
+        return _item_request(client, proxy_url, "POST", "/v1/responses/compact", body={"model": model, **body},
+                             expected_status=None)
+
+    window = compact({"input": [{"role": "user", "content": COMPACTION_NOTES}]})
+    _observed_turn(client, proxy_url, {
+        "model": model, "store": False, "stream": stream,
+        "input": window.get("output", []) + [{"role": "user", "content": RECALL_PROMPT}],
+    })
+    stored = _observed_turn(client, proxy_url, {"model": model, "store": True, "input": COMPACTION_NOTES})
+    compact({"previous_response_id": stored["id"]})
+    compact({})
+
+    # A generated 64x64 red PNG makes loss of retained media observable without inspecting opaque compaction data.
+    image_url = (
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgn"
+        "ABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ"
+        "3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"
+    )
+    window = compact({"input": [{"role": "user", "content": [
+        {"type": "input_text", "text": COMPACTION_NOTES + " Remember this image for later."},
+        {"type": "input_image", "image_url": image_url, "detail": "low"},
+    ]}]})
+    previous = None
+    for _ in range(3):
+        request = {"model": model, "store": True, "stream": stream,
+                   "input": [{"role": "user", "content": "Reply only OK."}]}
+        if previous:
+            request["previous_response_id"] = previous
+        else:
+            request["input"] = window["output"] + request["input"]
+        continued = _observed_turn(client, proxy_url, request)
+        previous = continued["id"]
+        _item_request(client, proxy_url, "GET", f"/v1/responses/{previous}/input_items",
+                      params={"order": "asc", "limit": 100})
+
+
+def _record_compaction_multi_agent(client: httpx.Client, proxy_url: str, model: str, stream: bool) -> None:
+    """The in-turn chain with `multi_agent` enabled: B (t2) passes the threshold; its input items (t3), C (t4) and
+    C's input items (t5) show what a multi-agent compaction outputs and stores."""
+    # Only the Responses API accepts the multi-agent beta.
+    client.event_hooks["request"].append(
+        lambda sent: sent.headers.__setitem__("OpenAI-Beta", "responses_multi_agent=v1")
+        if sent.url.path == "/v1/responses" else None
+    )
+
+    def turn(prompt: str, previous: str | None = None, **extra: Any) -> dict:
+        body = {"model": model, "store": True, "stream": False, "input": prompt, "multi_agent": {"enabled": True},
+                **extra}
+        if previous:
+            body["previous_response_id"] = previous
+        return _observed_turn(client, proxy_url, body)
+
+    def input_items(response: dict) -> dict:
+        return _item_request(client, proxy_url, "GET", f"/v1/responses/{response['id']}/input_items",
+                             params={"order": "asc"}, expected_status=None)
+
+    first = turn(COMPACTION_NOTES)
+    compacting = turn("Count from 1 to 60, one number per line, digits only.", first["id"],
+                      stream=stream, context_management=COMPACTION_THRESHOLD)
+    input_items(compacting)
+    follow_up = turn(RECALL_PROMPT, compacting["id"], context_management=COMPACTION_THRESHOLD)
+    input_items(follow_up)
+
+
+def _record_compaction_store_false(client: httpx.Client, proxy_url: str, model: str, stream: bool) -> None:
+    """An unstored turn that passes the threshold (t1): its output still carries the compaction, and nothing is
+    stored, so retrieving it (t2) fails. t3–t6 send its compaction back as input ([`_record_checkpoint_replay`])."""
+    response = _observed_turn(client, proxy_url, {
+        "model": model, "store": False, "stream": stream,
+        "input": COMPACTION_NOTES + " Then count from 1 to 30, one number per line.",
+        "context_management": COMPACTION_THRESHOLD,
+    })
+    _item_request(client, proxy_url, "GET", f"/v1/responses/{response.get('id', 'resp_missing')}",
+                  expected_status=None)
+    _record_checkpoint_replay(client, proxy_url, model, response)
+
+
+def _record_compaction_mcp(client: httpx.Client, proxy_url: str, model: str, stream: bool) -> None:
+    """Compare MCP discovery before compaction, after standalone compaction, and after automatic compaction."""
+    tools = [{"type": "mcp", "server_label": "microsoft_learn", "server_url": "https://learn.microsoft.com/api/mcp",
+              "allowed_tools": ["microsoft_docs_search"], "require_approval": "never"}]
+
+    def turn(input_value: Any, **extra: Any) -> dict:
+        response = _observed_turn(client, proxy_url, {
+            "model": model, "store": True, "stream": stream, "input": input_value, "tools": tools,
+            "max_output_tokens": 4096, **extra,
+        })
+        if response.get("status") != "completed":
+            raise RuntimeError(f"MCP compaction probe did not complete: {response.get('incomplete_details')}")
+        return response
+
+    prompt = "Remember the word APRICOT. Do not call any tools. Reply only READY."
+    first = turn(prompt)
+    history = [{"role": "user", "content": prompt}, *first["output"]]
+    compacted = _item_request(client, proxy_url, "POST", "/v1/responses/compact",
+                              body={"model": model, "input": history})
+    followup = [{"role": "user", "content": RECALL_PROMPT + " Do not call any tools."}]
+    turn([*history, *followup])
+    turn([*compacted["output"], *followup])
+    automatic = turn(COMPACTION_NOTES + " Do not call any tools.", previous_response_id=first["id"],
+                     context_management=COMPACTION_THRESHOLD)
+    continued = turn(followup, previous_response_id=automatic["id"])
+    _item_request(client, proxy_url, "GET", f"/v1/responses/{continued['id']}/input_items",
+                  params={"order": "asc"})
+    expanded = dict(tools[0], allowed_tools=["microsoft_docs_search", "microsoft_docs_fetch"])
+    unrestricted = {key: value for key, value in tools[0].items() if key != "allowed_tools"}
+    probe = ("Use microsoft_docs_fetch to read https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses "
+             "then say DONE. If that tool is unavailable, say UNAVAILABLE. Do not use microsoft_docs_search.")
+    for declaration in [expanded, unrestricted]:
+        turn(probe, previous_response_id=first["id"], tools=[declaration])
+    empty = [dict(tools[0], allowed_tools=["no_such_tool"])]
+    empty_response = turn(prompt, tools=empty)
+    turn(prompt, previous_response_id=empty_response["id"], tools=empty)
+
+
+COMPACTION_SCENARIOS: dict[str, tuple[Callable[..., None], int]] = {
+    "compaction-mcp": (_record_compaction_mcp, 11),
+    "compaction-in-turn-chain": (_record_compaction_in_turn_chain, 9),
+    "compaction-tool-loop": (_record_compaction_tool_loop, 10),
+    "compaction-standalone": (_record_compaction_standalone, 12),
+    "compaction-multi-agent": (_record_compaction_multi_agent, 5),
+    "compaction-store-false": (_record_compaction_store_false, 6),
+}
+
+
+def _record_competing_tool_outputs(client: httpx.Client, proxy_url: str, model: str) -> None:
+    """Resolve one pending function call twice: streamed turn B (21) and, while B streams, turn C (5).
+
+    Both turns rehydrate the same pending call before either commits. D then continues the conversation,
+    showing whether both outputs are kept and whether the conversation stays usable.
+    """
+    _number_requests_in_send_order(client)
+    conversation = _create_conversation(client, proxy_url)
+    items_path = f"/v1/conversations/{conversation}/items"
+    ascending = {"order": "asc"}
+
+    def turn(input_items: list[dict], during: Callable[[], None] | None = None, tool_choice: str = "none") -> dict:
+        body = {"model": model, "conversation": conversation, "store": True, "stream": during is not None,
+                "input": input_items, "tools": [WEATHER_TOOL], "tool_choice": tool_choice,
+                "parallel_tool_calls": False}
+        return _observed_turn(client, proxy_url, body, during)
+
+    def output(temperature: int) -> list[dict]:
+        return [{"type": "function_call_output", "call_id": call_id,
+                 "output": json.dumps({"temperature_c": temperature})}]
+
+    def request(method: str, path: str, **kwargs: Any) -> dict:
+        return _item_request(client, proxy_url, method, path, expected_status=None, **kwargs)
+
+    calling = turn([{"role": "user", "content": (
+        "Call get_weather for Paris. After you get the result, count from 1 to 120, one number per line, "
+        "digits only, then state the temperature.")}], tool_choice="required")
+    calls = [item for item in calling.get("output", []) if item.get("type") == "function_call"]
+    if len(calls) != 1:
+        raise RuntimeError(f"expected one get_weather call, got {calling.get('output')}")
+    call_id = calls[0]["call_id"]
+    side: dict = {}
+    streamed = turn(output(21), lambda: side.update(turn(output(5))))
+    request("GET", items_path, params=ascending)
+    inputs = lambda response: _input_items_or_conversation(request, response, items_path)
+    inputs(streamed)
+    inputs(side)
+    inputs(turn([{"role": "user", "content": "What temperature did get_weather report? Reply with only the number."}]))
+
+
+
+def _record_call_ids(client: httpx.Client, proxy_url: str, model: str) -> None:
+    """Send function calls whose call_id is repeated, reused from a stored turn, or empty.
+
+    Each request carries its case name in `x-run-id`; its status is recorded, not asserted. A conversation's
+    follow-ups run only when its creation succeeded.
+    """
+    user = {"role": "user", "content": "What's the weather in Paris?"}
+
+    def call(call_id: str) -> dict:
+        return {"type": "function_call", "call_id": call_id, "name": "get_weather",
+                "arguments": json.dumps({"city": "Paris"})}
+
+    def output(call_id: str, text: str = "sunny") -> dict:
+        return {"type": "function_call_output", "call_id": call_id, "output": text}
+
+    def request(case: str, method: str, path: str, **kwargs: Any) -> dict:
+        return _item_request(client, proxy_url, method, path, headers={"x-run-id": case},
+                             expected_status=None, **kwargs)
+
+    def respond(case: str, input_items: list[dict], store: bool = False, **fields: Any) -> dict:
+        return request(case, "POST", "/v1/responses", body={
+            "model": model, "input": input_items, "tools": [WEATHER_TOOL], "store": store, "stream": False,
+            **fields})
+
+    for case, items in (
+        ("A", [user, call("call_a"), output("call_a"), call("call_a"), output("call_a", "rainy")]),
+        ("A2", [user, call("call_a2"), call("call_a2"), output("call_a2")]),
+        ("B", [user, call(""), output("")]),
+        ("D", [user, call("call_d"), output("call_d"), output("call_d", "rainy")]),
+        ("H", [user, call("call_h"), output("call_h"), call("call_h")]),
+    ):
+        respond(case, items)
+    first = respond("C0", [user], store=True, tool_choice="required")
+    calls = [item for item in first.get("output", []) if item.get("type") == "function_call"]
+    if not calls:
+        raise RuntimeError(f"C0: expected a get_weather call, got {first}")
+    call_id = calls[0]["call_id"]
+    for case, items in (
+        ("C1", [output(call_id), call(call_id), output(call_id, "rainy")]),
+        ("C2", [output(call_id), output(call_id, "rainy")]),
+        ("C3", [output(call_id)]),
+    ):
+        respond(case, items, previous_response_id=first["id"])
+
+    def turn(case: str, conversation: str) -> None:
+        respond(case, [{"role": "user", "content": "And tomorrow?"}], store=True, conversation=conversation)
+
+    def create(case: str, items: list[dict]) -> str | None:
+        return request(case, "POST", "/v1/conversations", body={"items": items}).get("id")
+
+    if conversation := create("E0", [user, call("call_e"), output("call_e"), call("call_e"),
+                                     output("call_e", "rainy")]):
+        request("E1", "GET", f"/v1/conversations/{conversation}/items", params={"order": "asc"})
+        turn("E2", conversation)
+    if conversation := create("F0", [user, call("call_f"), output("call_f")]):
+        request("F1", "POST", f"/v1/conversations/{conversation}/items",
+                body={"items": [call("call_f"), output("call_f", "rainy")]})
+        turn("F2", conversation)
+    if conversation := create("G0", [user, call(""), output("")]):
+        turn("G1", conversation)
+
+
+def _record_overlapping_multi_agent(client: httpx.Client, proxy_url: str, model: str) -> None:
+    """Overlap two multi-agent turns that continue the same tree: streamed turn B (t3) and, while B streams, turn C
+    (t4), which leaves a get_weather call pending. Both rehydrate the tree before either commits.
+
+    D (t6) answers C's call, showing whether the turn that committed first keeps its pending call when B finishes
+    after it.
+    """
+    _number_requests_in_send_order(client)
+    # Only the Responses API accepts the multi-agent beta; the Conversations API rejects it as unknown.
+    client.event_hooks["request"].append(
+        lambda sent: sent.headers.__setitem__("OpenAI-Beta", "responses_multi_agent=v1")
+        if sent.url.path == "/v1/responses" else None
+    )
+    conversation = _create_conversation(client, proxy_url)
+    items_path = f"/v1/conversations/{conversation}/items"
+    ascending = {"order": "asc"}
+
+    def turn(input_items: list[dict], during: Callable[[], None] | None = None, tool_choice: str = "none") -> dict:
+        body = {"model": model, "conversation": conversation, "store": True, "stream": during is not None,
+                "input": input_items, "tools": [WEATHER_TOOL], "tool_choice": tool_choice,
+                "parallel_tool_calls": False, "multi_agent": {"enabled": True}}
+        return _observed_turn(client, proxy_url, body, during)
+
+    def user(text: str) -> list[dict]:
+        return [{"role": "user", "content": text}]
+
+    def request(method: str, path: str, **kwargs: Any) -> dict:
+        return _item_request(client, proxy_url, method, path, expected_status=None, **kwargs)
+
+    turn(user("Remember the word APRICOT. Reply with only OK."))
+    side: dict = {}
+    turn(user("Count from 1 to 120, one number per line, digits only."),
+         lambda: side.update(turn(user("Call get_weather for Paris."), tool_choice="required")))
+    request("GET", items_path, params=ascending)
+    calls = [item for item in side.get("output", []) if item.get("type") == "function_call"]
+    if len(calls) != 1:
+        raise RuntimeError(f"expected one get_weather call from turn C, got {side}")
+    turn([{"type": "function_call_output", "call_id": calls[0]["call_id"],
+           "output": json.dumps({"temperature_c": 7})}])
+    request("GET", items_path, params=ascending)
+
+
+def run_items(
+    client: httpx.Client, proxy_url: str, model: str, scenario: str, stream: bool,
+    *, max_output_tokens: int | None = None,
+) -> None:
+    """Record each fixed Conversation Items or Responses API request as a numbered step."""
+    if scenario == "multi-agent-store-false":
+        run_multi_agent_store_false(
+            client, proxy_url, model, stream,
+            run_responses=run_responses, load_tool_outputs=_load_tool_outputs_file,
+            max_output_tokens=max_output_tokens,
+        )
+        return
+    if scenario == "concurrent-writes":
+        if not stream:
+            raise click.UsageError("--items-scenario concurrent-writes streams turn B; use --stream.")
+        _record_concurrent_writes(client, proxy_url, model)
+        return
+    if scenario in COMPACTION_SCENARIOS:
+        COMPACTION_SCENARIOS[scenario][0](client, proxy_url, model, stream)
+        return
+    if scenario in ("stale-compaction", "competing-tool-outputs", "overlapping-multi-agent"):
+        if not stream:
+            raise click.UsageError(f"--items-scenario {scenario} streams turn B; use --stream.")
+        record = {
+            "stale-compaction": _record_stale_compaction,
+            "competing-tool-outputs": _record_competing_tool_outputs,
+            "overlapping-multi-agent": _record_overlapping_multi_agent,
+        }[scenario]
+        record(client, proxy_url, model)
+        return
+    if scenario == "store-false":
+        conv_id = _create_conversation(client, proxy_url)
+        items_path = f"/v1/conversations/{conv_id}/items"
+        first = _item_response(
+            client, proxy_url, model,
+            "Remember the secret word ORCHID. Reply with only OK.",
+            conversation=conv_id, stream=stream, store=False,
+        )
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+        _item_request(client, proxy_url, "GET", f"/v1/responses/{first['id']}", expected_status=None)
+        _item_response(
+            client, proxy_url, model,
+            "Remember the secret word SAPPHIRE. Reply with only OK.",
+            conversation=conv_id, stream=stream,
+        )
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+        child = _item_response(
+            client, proxy_url, model,
+            "What secret word did I ask you to remember? Reply with that word only. After replying, remember RUBY instead.",
+            conversation=conv_id, stream=stream, store=False,
+        )
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+        _item_request(client, proxy_url, "GET", f"/v1/responses/{child['id']}", expected_status=None)
+        _item_response(
+            client, proxy_url, model,
+            "What secret word did I ask you to remember? Reply with that word only.",
+            conversation=conv_id, stream=stream,
+        )
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+        return
+    if scenario == "response-call-ids":
+        _record_call_ids(client, proxy_url, model)
+        return
+    if scenario == "response-tool-items":
+        run_tool_items(client, proxy_url, model, send_request=_item_request,
+                       extract_tool_calls=_extract_tool_calls,
+                       load_tool_outputs=_load_tool_outputs_file,
+                       build_tool_output_input=_build_tool_output_input)
+        return
+    if scenario == "response-lifecycle":
+        first = _item_response(client, proxy_url, model, "Reply with only SAPPHIRE.", stream=stream)
+        first_path = f"/v1/responses/{first['id']}"
+        _item_request(client, proxy_url, "GET", f"{first_path}/input_items")
+        child = _item_response(
+            client, proxy_url, model, "Reply with only ORCHID.",
+            previous_response_id=first["id"], stream=stream,
+        )
+        child_path = f"/v1/responses/{child['id']}"
+        child_items_path = f"{child_path}/input_items"
+        _item_request(client, proxy_url, "GET", child_items_path, params={"order": "asc"})
+        page = _item_request(
+            client, proxy_url, "GET", child_items_path,
+            params={"order": "asc", "limit": 1},
+        )
+        if not page.get("last_id") or not page.get("has_more"):
+            raise RuntimeError(f"expected a non-final one-item input page: {page}")
+        _item_request(
+            client, proxy_url, "GET", child_items_path,
+            params={"order": "asc", "limit": 1, "after": page["last_id"]},
+        )
+        _item_request(client, proxy_url, "GET", child_path)
+        _item_request(client, proxy_url, "DELETE", first_path)
+        _item_request(client, proxy_url, "GET", first_path, expected_status=None)
+        _item_request(client, proxy_url, "GET", f"{first_path}/input_items", expected_status=None)
+        _item_request(client, proxy_url, "GET", child_items_path, params={"order": "asc"})
+        _item_request(client, proxy_url, "GET", child_path)
+        _item_request(client, proxy_url, "DELETE", first_path, expected_status=None)
+        # A listing's deletion visibility does not establish what inference sees.
+        # Continue the surviving child before deleting it and capture both the
+        # model's answer and the new response's input window.
+        continuation = _item_response(
+            client, proxy_url, model,
+            "What exact word did the first user message ask you to reply with? Reply with only that word.",
+            previous_response_id=child["id"], stream=stream,
+        )
+        continuation_path = f"/v1/responses/{continuation['id']}"
+        _item_request(client, proxy_url, "GET", f"{continuation_path}/input_items", params={"order": "asc"})
+        _item_request(client, proxy_url, "DELETE", continuation_path)
+        _item_request(client, proxy_url, "DELETE", child_path)
+        _item_request(client, proxy_url, "GET", child_items_path, expected_status=None)
+        _item_request(client, proxy_url, "GET", child_path, expected_status=None)
+        return
+    if scenario == "response-pagination":
+        first = _item_response(client, proxy_url, model, "Reply with only SAPPHIRE.", stream=stream)
+        child = _item_response(
+            client, proxy_url, model, "Reply with only ORCHID.",
+            previous_response_id=first["id"], stream=stream,
+        )
+        path = f"/v1/responses/{child['id']}/input_items"
+        _item_request(client, proxy_url, "GET", path, params={"order": "asc"})
+        _item_request(client, proxy_url, "GET", path, params={"order": "desc"})
+        for order in ("asc", "desc"):
+            page = _item_request(client, proxy_url, "GET", path, params={"order": order, "limit": 1})
+            if not page.get("last_id") or not page.get("has_more"):
+                raise RuntimeError(f"expected a non-final {order} page: {page}")
+            _item_request(
+                client, proxy_url, "GET", path,
+                params={"order": order, "limit": 1, "after": page["last_id"]},
+            )
+        _item_request(client, proxy_url, "GET", path)
+        for order in ("asc", "desc"):
+            page = _item_request(client, proxy_url, "GET", path, params={"order": order, "limit": 100})
+            if not page.get("last_id"):
+                raise RuntimeError(f"expected an input cursor: {page}")
+            _item_request(client, proxy_url, "GET", path,
+                          params={"order": order, "after": page["last_id"]}, expected_status=None)
+        foreign = _item_response(client, proxy_url, model, "Reply with only VIOLET.", stream=stream)
+        foreign_page = _item_request(client, proxy_url, "GET", f"/v1/responses/{foreign['id']}/input_items")
+        _item_request(client, proxy_url, "GET", path,
+                      params={"after": foreign_page["data"][0]["id"]}, expected_status=None)
+        return
+    if scenario == "response-edge-cases":
+        transient = _item_response(client, proxy_url, model, "Reply with only SAPPHIRE.", stream=stream, store=False)
+        transient_path = f"/v1/responses/{transient['id']}"
+        for method, path in (
+            ("GET", transient_path), ("GET", f"{transient_path}/input_items"),
+            ("DELETE", transient_path), ("GET", "/v1/responses/resp_missing"),
+            ("GET", "/v1/responses/resp_missing/input_items"),
+            ("DELETE", "/v1/responses/resp_missing"),
+        ):
+            _item_request(client, proxy_url, method, path, expected_status=None)
+        _item_request(
+            client, proxy_url, "POST", "/v1/responses",
+            body={"model": model, "input": [{"role": "user", "content": "Reply with only ORCHID."}],
+                  "previous_response_id": "resp_missing", "store": True, "stream": False},
+            expected_status=None,
+        )
+        stored = _item_response(client, proxy_url, model, "Reply with only ORCHID.", stream=stream)
+        path = f"/v1/responses/{stored['id']}/input_items"
+        for params in (
+            {"limit": "0"}, {"limit": "101"}, {"order": "sideways"},
+            {"after": "msg_missing"}, {"include[]": "web_search_call.results"},
+            {"include[]": "message.output_text.logprobs"},
+            {"limit": "-1"}, {"limit": "ten"}, {"after": ""},
+            {"include[]": "not.a.valid.include"},
+            [("limit", "1"), ("limit", "2")],
+            [("include[]", "message.output_text.logprobs"),
+             ("include[]", "reasoning.encrypted_content")],
+        ):
+            _item_request(client, proxy_url, "GET", path, params=params, expected_status=None)
+        _item_request(client, proxy_url, "DELETE", f"/v1/responses/{stored['id']}")
+        _item_request(client, proxy_url, "DELETE", f"/v1/responses/{stored['id']}", expected_status=None)
+        return
+    if scenario == "response-conversation":
+        conversation = _create_conversation(client, proxy_url)
+        items_path = f"/v1/conversations/{conversation}/items"
+        _item_request(client, proxy_url, "POST", items_path,
+                      body={"items": [{"role": "user", "content": "Remember SAPPHIRE."}]})
+        first = _item_response(client, proxy_url, model, "Reply with only SAPPHIRE.",
+                               conversation=conversation, stream=stream)
+        first_path = f"/v1/responses/{first['id']}"
+        _item_request(client, proxy_url, "GET", f"{first_path}/input_items", params={"order": "asc"})
+        added = _item_request(client, proxy_url, "POST", items_path,
+                              body={"items": [{"role": "user", "content": "Now remember ORCHID."}]})
+        _item_request(client, proxy_url, "GET", f"{first_path}/input_items", params={"order": "asc"})
+        child = _item_response(client, proxy_url, model, "Reply with only ORCHID.",
+                               conversation=conversation, stream=stream)
+        child_path = f"/v1/responses/{child['id']}"
+        _item_request(client, proxy_url, "GET", f"{child_path}/input_items", params={"order": "asc"})
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+        _item_request(client, proxy_url, "DELETE", f"{items_path}/{added['data'][0]['id']}")
+        for path in (child_path, first_path):
+            _item_request(client, proxy_url, "GET", f"{path}/input_items",
+                          params={"order": "asc"}, expected_status=None)
+        _item_request(client, proxy_url, "DELETE", first_path)
+        _item_request(client, proxy_url, "GET", f"{child_path}/input_items",
+                      params={"order": "asc"}, expected_status=None)
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+        _item_request(client, proxy_url, "GET", child_path, expected_status=None)
+        _item_request(client, proxy_url, "DELETE", f"/v1/conversations/{conversation}")
+        _item_request(client, proxy_url, "GET", f"{child_path}/input_items", expected_status=None)
+        _item_request(client, proxy_url, "GET", child_path, expected_status=None)
+        return
+    if scenario == "response-replayed-items":
+        seed = _item_response(client, proxy_url, model, "Reply with only SAPPHIRE.", stream=stream)
+        seed_items = f"/v1/responses/{seed['id']}/input_items"
+        page = _item_request(client, proxy_url, "GET", seed_items, params={"order": "asc"})
+        reused = {"type": "message", "id": page["data"][0]["id"],
+                  "role": "user", "content": "Reply with only ORCHID."}
+        for items in (
+            [reused],
+            [reused, {**reused, "content": "Reply with only VIOLET."}],
+            [{**reused, "id": f"item_wrongprefix_{secrets.token_hex(8)}"}],
+            [{"type": "function_call", "call_id": "call_history_probe", "name": "lookup",
+              "arguments": "{}"},
+             {"type": "function_call_output", "call_id": "call_history_probe", "output": "SAPPHIRE"},
+             {"role": "user", "content": "Reply with only the lookup result."}],
+        ):
+            # Probe status is evidence. On rejection, still inspect the seed to
+            # establish that rejected input did not mutate its stored context.
+            result = _item_request(client, proxy_url, "POST", "/v1/responses",
+                                   body={"model": model, "input": items, "store": True,
+                                         "stream": False}, expected_status=None)
+            response_id = result.get("id", seed["id"])
+            _item_request(client, proxy_url, "GET", f"/v1/responses/{response_id}/input_items",
+                          params={"order": "asc"}, expected_status=None)
+            _item_request(client, proxy_url, "GET", seed_items, params={"order": "asc"})
+        return
+    if scenario == "edge-cases":
+        for item in (
+            {
+                "type": "message",
+                "id": f"item_wrongprefix_{secrets.token_hex(8)}",
+                "role": "user",
+                "content": "test",
+            },
+            {
+                "type": "function_call",
+                "id": f"msg_wrongprefix_{secrets.token_hex(8)}",
+                "call_id": "call_prefix_probe",
+                "name": "test_fn",
+                "arguments": "{}",
+            },
+        ):
+            probe_conversation = _create_conversation(client, proxy_url)
+            probe_items_path = f"/v1/conversations/{probe_conversation}/items"
+            _item_request(
+                client, proxy_url, "POST", probe_items_path,
+                body={"items": [item]}, expected_status=None,
+            )
+            _item_request(client, proxy_url, "GET", probe_items_path)
+
+        cursor_conversation = _create_conversation(client, proxy_url)
+        cursor_items_path = f"/v1/conversations/{cursor_conversation}/items"
+        _item_request(
+            client, proxy_url, "POST", cursor_items_path,
+            body={"items": [
+                {"type": "message", "role": "user", "content": f"msg{i}"}
+                for i in range(1, 4)
+            ]},
+        )
+        page = _item_request(client, proxy_url, "GET", cursor_items_path, params={"limit": 2})
+        if len(page.get("data", [])) != 2 or not page.get("last_id"):
+            raise RuntimeError(f"expected a two-item page with last_id: {page}")
+        cursor = page["last_id"]
+        _item_request(client, proxy_url, "DELETE", f"{cursor_items_path}/{cursor}")
+        _item_request(
+            client, proxy_url, "GET", cursor_items_path,
+            params={"after": cursor, "limit": 2}, expected_status=None,
+        )
+        # The first item on the page survived deletion; reuse its real public ID.
+        _record_duplicate_items(client, proxy_url, cursor_items_path, page["data"][0]["id"])
+        return
+
+    conv_id = _create_conversation(client, proxy_url)
+    items_path = f"/v1/conversations/{conv_id}/items"
+
+    first = _item_response(
+        client,
+        proxy_url,
+        model,
+        "Remember the secret word SAPPHIRE. Reply with only SAPPHIRE.",
+        conversation=conv_id,
+        stream=stream,
+    )
+    added = _item_request(
+        client,
+        proxy_url,
+        "POST",
+        items_path,
+        body={"items": [{"role": "user", "content": "The new secret word is ORCHID."}]},
+    )
+    item_id = added["data"][0]["id"]
+
+    if scenario == "pagination":
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+        first_page = _item_request(
+            client, proxy_url, "GET", items_path, params={"order": "asc", "limit": 2}
+        )
+        cursor = first_page.get("last_id")
+        if not cursor:
+            raise RuntimeError("first item page has no cursor")
+        _item_request(
+            client,
+            proxy_url,
+            "GET",
+            items_path,
+            params={"order": "asc", "limit": 2, "after": cursor},
+        )
+        _item_request(client, proxy_url, "GET", items_path, params={"order": "desc"})
+        descending_page = _item_request(
+            client, proxy_url, "GET", items_path, params={"order": "desc", "limit": 2}
+        )
+        descending_cursor = descending_page.get("last_id")
+        if not descending_cursor:
+            raise RuntimeError("first descending item page has no cursor")
+        _item_request(
+            client,
+            proxy_url,
+            "GET",
+            items_path,
+            params={"order": "desc", "limit": 2, "after": descending_cursor},
+        )
+        _item_request(
+            client,
+            proxy_url,
+            "GET",
+            items_path,
+            params={"order": "asc", "include[]": "message.output_text.logprobs"},
+        )
+        return
+    if scenario == "deletion":
+        _item_request(client, proxy_url, "DELETE", f"{items_path}/{item_id}")
+    elif scenario == "branch":
+        _item_response(
+            client,
+            proxy_url,
+            model,
+            "What is the most recent secret word? Reply with only that word.",
+            previous_response_id=first["id"],
+            stream=stream,
+        )
+        _item_request(
+            client,
+            proxy_url,
+            "POST",
+            items_path,
+            body={"items": [{"role": "user", "content": "The branch marker is VIOLET."}]},
+        )
+    else:
+        _item_response(
+            client,
+            proxy_url,
+            model,
+            "What is the most recent secret word? Reply with only that word.",
+            conversation=conv_id,
+            stream=stream,
+        )
+
+    _item_request(client, proxy_url, "GET", items_path, params={"order": "asc"})
+
+
+def _send_nonstreaming(client: httpx.Client, body: dict, proxy_url: str) -> dict | None:
+    finished = threading.Event()
+    started = time.monotonic()
+
+    def report_wait() -> None:
+        while not finished.wait(15):
+            click.echo(f"  [waiting for non-streaming response: {time.monotonic() - started:.0f}s elapsed]")
+
+    click.echo(f"  [sending HTTP Responses request; waiting for response (upstream read timeout: {HTTP_READ_TIMEOUT}s)]")
+    reporter = threading.Thread(target=report_wait, daemon=True)
+    reporter.start()
+    try:
+        # Let the proxy record and report an upstream timeout before this
+        # client times out waiting for the proxy itself.
+        resp = client.post(f"{proxy_url}/v1/responses", json=body, timeout=_http_timeout(proxy_client=True))
+    except httpx.TimeoutException as error:
+        raise click.ClickException(
+            "Timed out waiting for the non-streaming HTTP response. "
+            "No complete response was received; inspect the cassette before retrying."
+        ) from error
+    finally:
+        finished.set()
+        reporter.join()
+    _raise_recording_http_error(resp)
+    data = resp.json()
+    print(f"\n[Response]\n{json.dumps(data, indent=2)}\n")
+    return data
+
+
+def _send_streaming(
+    client: httpx.Client, body: dict, proxy_url: str, on_first_delta: Callable[[], None] | None = None
+) -> dict | None:
+    """Stream a Responses call; `on_first_delta` runs once, mid-stream, after the first output text delta."""
+    response_data = None
+    print("\n[Streaming response]")
+    with client.stream(
+        "POST", f"{proxy_url}/v1/responses", json=body, timeout=_http_timeout(proxy_client=True)
+    ) as resp:
+        if resp.status_code != 200:
+            # Drain the body fully before raising: the recording proxy is an
+            # async generator that only finishes writing this turn once its
+            # response is fully consumed. Raising immediately (before reading)
+            # aborts the connection and can tear the proxy's generator down
+            # before it appends the turn, silently losing this turn's error
+            # response from the cassette entirely.
+            resp.read()
+        _raise_recording_http_error(resp)
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            print(line)
+            if line.startswith("data:") and line != "data: [DONE]":
+                try:
+                    payload = json.loads(line[5:].strip())
+                    if payload.get("type") == "response.completed":
+                        response_data = payload.get("response")
+                    elif payload.get("object") == "response" and payload.get("status") == "completed":
+                        response_data = payload
+                except Exception:
+                    continue
+                if on_first_delta and payload.get("type") == "response.output_text.delta":
+                    on_first_delta, during = None, on_first_delta
+                    during()
+    print()
+    if on_first_delta:
+        raise RuntimeError("stream ended before the first output text delta")
+    return response_data
+
+
+def _send_messages_nonstreaming(client: httpx.Client, body: dict, proxy_url: str) -> dict | None:
+    """Send an Anthropic Messages request (non-streaming) and return the message object."""
+    resp = client.post(f"{proxy_url}/v1/messages", json=body, timeout=300)
+    resp.raise_for_status()
+    data = resp.json()
+    print(f"\n[Message]\n{json.dumps(data, indent=2)}\n")
+    return data
+
+
+def _send_messages_streaming(client: httpx.Client, body: dict, proxy_url: str) -> dict | None:
+    """Send an Anthropic Messages request (streaming) and reconstruct the final message.
+
+    Anthropic SSE sends the message envelope in `message_start`, then mutates it via
+    `content_block_start`/`content_block_delta`/`content_block_stop` and `message_delta`.
+    We accumulate those into the final message object so callers can chain the next turn.
+    """
+    message: dict | None = None
+    blocks: dict[int, dict] = {}
+    print("\n[Streaming message]")
+    with client.stream("POST", f"{proxy_url}/v1/messages", json=body, timeout=300) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line or not line.startswith("data:"):
+                continue
+            print(line)
+            try:
+                event = json.loads(line[5:].strip())
+            except Exception:
+                continue
+            etype = event.get("type")
+            if etype == "message_start":
+                message = event.get("message", {})
+            elif etype == "content_block_start":
+                blocks[event["index"]] = event.get("content_block", {})
+            elif etype == "content_block_delta":
+                blk = blocks.setdefault(event["index"], {})
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    blk["type"] = blk.get("type", "text")
+                    blk["text"] = blk.get("text", "") + delta.get("text", "")
+                elif delta.get("type") == "input_json_delta":
+                    blk["type"] = blk.get("type", "tool_use")
+                    blk["_partial_json"] = blk.get("_partial_json", "") + delta.get("partial_json", "")
+                elif delta.get("type") == "thinking_delta":
+                    blk["type"] = blk.get("type", "thinking")
+                    blk["thinking"] = blk.get("thinking", "") + delta.get("thinking", "")
+                elif delta.get("type") == "signature_delta":
+                    blk["type"] = blk.get("type", "thinking")
+                    blk["signature"] = blk.get("signature", "") + delta.get("signature", "")
+            elif etype == "message_delta" and message is not None:
+                message.update({k: v for k, v in event.get("delta", {}).items()})
+    print()
+    if message is not None:
+        # Finalize accumulated tool_use input from partial JSON. Invalid
+        # arguments must fail recording rather than being replaced with `{}`.
+        for blk in blocks.values():
+            if blk.get("type") == "tool_use" and "_partial_json" in blk:
+                raw = blk.pop("_partial_json")
+                blk["input"] = json.loads(raw) if raw else {}
+        message["content"] = [blocks[i] for i in sorted(blocks)]
+    return message
+
+
+class WebSocketClient:
+    """Small stdlib websocket client for cassette recording."""
+
+    def __init__(self, url: str, headers: dict[str, str]) -> None:
+        self.url = url
+        self.headers = headers
+        self.sock: socket.socket | ssl.SSLSocket | None = None
+        self._receive_buffer = bytearray()
+        self.on_frame = None
+        self.handshake_response = None
+
+    def __enter__(self) -> "WebSocketClient":
+        parsed = urlparse(self.url)
+        if parsed.scheme not in {"ws", "wss"}:
+            raise ValueError(f"websocket URL must use ws:// or wss://, got {self.url}")
+
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        raw_sock = socket.create_connection((host, port), timeout=TIMEOUT)
+        if parsed.scheme == "wss":
+            context = ssl.create_default_context()
+            self.sock = context.wrap_socket(raw_sock, server_hostname=host)
+        else:
+            self.sock = raw_sock
+
+        key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        host_header = host if parsed.port is None else f"{host}:{port}"
+        request_headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host_header}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        for name, value in self.headers.items():
+            request_headers.append(f"{name}: {value}")
+        request = "\r\n".join(request_headers) + "\r\n\r\n"
+        self.sock.sendall(request.encode("utf-8"))
+
+        response = self._read_http_response()
+        status_line, _, header_text = response.partition("\r\n")
+        self.handshake_response = {
+            "status_code": int(status_line.split()[1]),
+            "headers": _filter_response_headers(_headers_from_text(header_text)),
+        }
+        if " 101 " not in status_line:
+            raise RuntimeError(f"websocket upgrade failed: {status_line}")
+        accept = _headers_from_text(header_text).get("sec-websocket-accept")
+        expected = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+        if accept != expected:
+            raise RuntimeError("websocket upgrade failed: invalid Sec-WebSocket-Accept")
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+        try:
+            self.send_close()
+        finally:
+            if self.sock is not None:
+                self.sock.close()
+
+    def _read_exact(self, size: int) -> bytes:
+        assert self.sock is not None
+        chunks = bytearray()
+        if self._receive_buffer:
+            buffered = min(size, len(self._receive_buffer))
+            chunks.extend(self._receive_buffer[:buffered])
+            del self._receive_buffer[:buffered]
+        while len(chunks) < size:
+            chunk = self.sock.recv(size - len(chunks))
+            if not chunk:
+                raise EOFError("websocket closed")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def _read_http_response(self) -> str:
+        assert self.sock is not None
+        data = bytearray()
+        while b"\r\n\r\n" not in data:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise EOFError("websocket closed during handshake")
+            data.extend(chunk)
+        header_end = data.index(b"\r\n\r\n") + 4
+        self._receive_buffer.extend(data[header_end:])
+        return data[:header_end].decode("iso-8859-1")
+
+    def send_text(self, text: str) -> None:
+        self._send_frame(0x1, text.encode("utf-8"))
+
+    def send_close(self) -> None:
+        if self.sock is not None:
+            try:
+                self._send_frame(0x8, b"")
+            except OSError:
+                pass
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        assert self.sock is not None
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length <= 0xFFFF:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", length))
+        mask = secrets.token_bytes(4)
+        header.extend(mask)
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        self.sock.sendall(bytes(header) + masked)
+        if self.on_frame is not None:
+            self.on_frame("client", opcode, payload, True)
+
+    def receive_text(self) -> str | None:
+        message = bytearray()
+        while True:
+            first, second = self._read_exact(2)
+            fin = bool(first & 0x80)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8))[0]
+            if length > 16 * 1024 * 1024:
+                raise RuntimeError("WebSocket frame exceeded the 16 MiB capture limit")
+            mask = self._read_exact(4) if masked else b""
+            payload = self._read_exact(length)
+            if masked:
+                payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+
+            if self.on_frame is not None:
+                self.on_frame("server", opcode, payload, fin)
+            if opcode == 0x8:
+                return None
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in {0x1, 0x0}:
+                if len(message) + len(payload) > 16 * 1024 * 1024:
+                    raise RuntimeError("WebSocket message exceeded the 16 MiB capture limit")
+                message.extend(payload)
+                if fin:
+                    return message.decode("utf-8")
+
+
+def _headers_from_text(header_text: str) -> dict[str, str]:
+    headers = {}
+    for line in header_text.split("\r\n"):
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def _websocket_url(base_url: str) -> str:
+    from websocket_recorder import RecordedSession
+
+    return RecordedSession.responses_url(base_url)
+
+
+def _send_websocket(
+    body: dict,
+    target_base_url: str,
+    headers: dict[str, str],
+    output_file: Path,
+) -> dict | None:
+    turn_num = _turn_number(output_file)
+    wire_body = dict(body)
+    wire_body["type"] = "response.create"
+    # WebSocket mode streams by transport; OpenAI's Responses WebSocket API
+    # does not use HTTP-only fields such as `stream`.
+    wire_body.pop("stream", None)
+    wire_body["store"] = True
+    websocket_url = _websocket_url(target_base_url)
+
+    turn: dict[str, Any] = {
+        "filename": f"t{turn_num}",
+        "request": {
+            "method": "WEBSOCKET",
+            "path": "/v1/responses",
+            "query_params": {},
+            "body": wire_body,
+            "headers": _filter_request_headers(headers),
+            "transport": "websocket",
+        },
+        "response": {
+            "status_code": 101,
+            "headers": {"transport": "websocket"},
+            "websocket": [],
+            "sse": [],
+        },
+    }
+
+    response_data = None
+    print("\n[WebSocket response]")
+    with WebSocketClient(websocket_url, headers) as ws:
+        ws.send_text(json.dumps(wire_body, separators=(",", ":")))
+        while True:
+            message = ws.receive_text()
+            if message is None:
+                break
+            print(message)
+            turn["response"]["websocket"].append(message)
+            try:
+                event = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            turn["response"]["sse"].append(
+                f"event: {event.get('type', '')}\n"
+                f"data: {json.dumps(event, separators=(',', ':'))}\n"
+            )
+            event_type = event.get("type")
+            if event_type == "response.completed":
+                response_data = event.get("response")
+                break
+            if event_type == "response.failed":
+                response_data = event.get("response")
+                break
+            if event_type == "error":
+                response_data = event
+                break
+    turn["response"]["sse"].append("data: [DONE]\n")
+    _append_turn(output_file, turn)
+    print(f"  [recorded turn {turn_num} -> {output_file.name}]")
+    return response_data
+
+
+def _send(
+    client: httpx.Client,
+    body: dict,
+    stream: bool,
+    proxy_url: str,
+    transport: str = "http",
+    target_base_url: str = "",
+    headers: dict[str, str] | None = None,
+    output_file: Path | None = None,
+) -> dict | None:
+    if transport == "websocket":
+        if output_file is None:
+            raise ValueError("output_file is required for websocket recording")
+        return _send_websocket(body, target_base_url, headers or {}, output_file)
+    return (
+        _send_streaming(client, body, proxy_url)
+        if stream
+        else _send_nonstreaming(client, body, proxy_url)
+    )
+
+
+def _prompt(label: str) -> str:
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        if line == "":
+            raise click.ClickException(f"Missing scripted prompt for {label.rstrip()}")
+        click.echo(f"{label.rstrip()} [read from stdin]")
+        return line.strip()
+    try:
+        return input(label).strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        sys.exit(0)
+
+
+def _load_response_input(path: str | None) -> str | list | None:
+    if path is None:
+        return None
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise click.UsageError(f"--input-file is not valid JSON: {error}") from error
+    if not isinstance(value, (str, list)):
+        raise click.UsageError("--input-file must contain a JSON string or array.")
+    return value
+
+
+def _load_tools_file(path: str | Path) -> list:
+    with open(path, encoding="utf-8") as source:
+        tools = json.load(source)
+    if not isinstance(tools, list):
+        raise click.UsageError("--tools file must contain a JSON array.")
+    return tools
+
+
+def _load_tool_outputs_file(path: str | Path) -> "dict[str, Any] | types.ModuleType":
+    if str(path).endswith(".py"):
+        spec = importlib.util.spec_from_file_location("cassette_tool_outputs", path)
+        if spec is None or spec.loader is None:
+            raise click.UsageError(f"--tool-outputs could not load Python module: {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    with open(path, encoding="utf-8") as source:
+        outputs = json.load(source)
+    if not isinstance(outputs, dict):
+        raise click.UsageError("--tool-outputs JSON file must contain an object (name -> output string).")
+    return outputs
+
+
+def _parse_reasoning(raw: str | None) -> dict | None:
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise click.UsageError(f"--reasoning is not valid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise click.UsageError("--reasoning must contain a JSON object.")
+    return value
+
+
+def _parse_multi_agent(raw: str | None) -> dict | None:
+    """Preserve supplied settings so the API, not the recorder, validates them."""
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise click.UsageError(f"--multi-agent is not valid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise click.UsageError("--multi-agent must contain a JSON object.")
+    return value
+
+
+def _parse_max_tool_calls(raw: str | None) -> list[int | None] | int | None:
+    """Return one limit for every turn, or one entry per turn where null omits the field."""
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise click.UsageError(f"--max-tool-calls is not valid JSON: {error}") from error
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, list) and all(
+        entry is None or (isinstance(entry, int) and not isinstance(entry, bool)) for entry in value
+    ):
+        return value
+    raise click.UsageError("--max-tool-calls must be an integer or a JSON array of integers and nulls.")
+
+
+def _max_tool_calls_for_turn(max_tool_calls: list[int | None] | int | None, turn: int) -> int | None:
+    if isinstance(max_tool_calls, list):
+        return max_tool_calls[turn - 1] if turn <= len(max_tool_calls) else None
+    return max_tool_calls
+
+
+def _inject_tools(
+    body: dict, tools: list | None, tool_choice: Any, parallel_tool_calls: bool | None = None
+) -> None:
+    if tools is not None:
+        body["tools"] = tools
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
+    if parallel_tool_calls is not None:
+        body["parallel_tool_calls"] = parallel_tool_calls
+
+
+def _extract_tool_calls(response_data: dict | None) -> list[dict]:
+    """Extract client-executed function, custom, shell, and tool-search calls from a response.
+
+    A hosted tool search (`execution: "server"`) is already resolved in the same
+    response, so it is not pending client work.
+    """
+    if not response_data:
+        return []
+    output = response_data.get("output", [])
+    return [
+        item
+        for item in output
+        if item.get("type") in {"function_call", "custom_tool_call", "shell_call"}
+        or (item.get("type") == "tool_search_call" and item.get("execution") != "server")
+    ]
+
+
+STRUCTURED_OUTPUT_PART_TYPES = frozenset({"input_text", "input_image", "input_file"})
+
+
+def _is_content_part_list(value: Any) -> bool:
+    """Whether a tool handler returned structured Responses content parts.
+
+    Only the part types the Responses API accepts in a structured tool output
+    qualify; any other list -- including dicts that merely carry a `type` key
+    such as `[{"type": "product", ...}]` -- stays an ordinary JSON result and
+    is stringified as before.
+    """
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(
+            isinstance(part, dict) and part.get("type") in STRUCTURED_OUTPUT_PART_TYPES
+            for part in value
+        )
+    )
+
+
+def _build_tool_output_input(
+    tool_calls: list[dict],
+    tool_outputs: "dict[str, Any] | types.ModuleType",
+    user_prompt: str | None,
+    tool_search_tools: list[dict] | None = None,
+) -> list[dict]:
+    """Build tool output items followed by an optional user message.
+
+    Args:
+        tool_calls: function_call, custom_tool_call, shell_call, or tool_search_call output items.
+        tool_outputs: either
+            - a dict mapping tool name -> fake JSON output string (loaded from a
+              --tool-outputs *.json* file), matched by name only; or
+            - a Python module (loaded from a --tool-outputs *.py* file) whose
+              functions are named after each tool. Each pending call invokes the
+              matching function with its actual parsed `arguments` as keyword
+              arguments -- naturally handling whatever argument types the model
+              used (string, number, ...) -- and the JSON-serialized return value
+              becomes the output. A returned list of typed content parts (for
+              example `input_text` and `input_image` dicts) is sent as the
+              structured `output` array instead of a string, which is how a
+              cassette records a tool returning an image. A function returning `None` omits that call's
+              output item entirely, which is how a cassette deliberately tests a
+              provider's behavior when the client leaves one specific pending
+              call unresolved (e.g. one of two parallel calls to the same tool
+              with different arguments) while resolving its sibling(s).
+            Shell calls use the key/function `shell`. Its value (or return value
+            from `shell(action=...)`) is an object containing the structured
+            `output` array and optional `max_output_length`, not a JSON string.
+        user_prompt: the next user message (None for tool-output-only turns).
+        tool_search_tools: tools returned for public or synthetic tool search.
+
+    Returns:
+        A list suitable for the `input` field of the next request.
+    """
+    input_items: list[dict] = []
+    for call in tool_calls:
+        call_id = call.get("call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError(
+                f"{call.get('type', 'tool')} item has no non-empty call_id"
+            )
+
+        call_type = call.get("type")
+        if call_type == "shell_call":
+            if isinstance(tool_outputs, types.ModuleType):
+                fn = getattr(tool_outputs, "shell", None)
+                result = fn(action=call["action"]) if fn else None
+            else:
+                result = tool_outputs.get("shell")
+            if result is None:
+                continue
+            if not isinstance(result, dict) or not isinstance(result.get("output"), list):
+                raise click.UsageError("shell tool output must be an object containing an output array")
+            item = {"type": "shell_call_output", "call_id": call_id, "output": result["output"]}
+            if "max_output_length" in result:
+                item["max_output_length"] = result["max_output_length"]
+            input_items.append(item)
+            continue
+        name = call.get("name", "")
+        is_public_search = call_type == "tool_search_call"
+        is_synthetic_search = call_type == "function_call" and name == "tool_search"
+        if is_public_search or is_synthetic_search:
+            if tool_search_tools is None:
+                raise ValueError("a tool-search call requires --tool-search-output-tools")
+            if is_public_search:
+                input_items.append(
+                    {
+                        "type": "tool_search_output",
+                        "call_id": call_id,
+                        "execution": "client",
+                        "status": "completed",
+                        "tools": copy.deepcopy(tool_search_tools),
+                    }
+                )
+            else:
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(
+                            {"tools": tool_search_tools},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    }
+                )
+            continue
+
+        if tool_search_tools is not None:
+            has_fixture = (
+                getattr(tool_outputs, name, None) is not None
+                if isinstance(tool_outputs, types.ModuleType)
+                else name in tool_outputs
+            )
+            if not has_fixture:
+                raise ValueError(
+                    f"loaded function {name!r} requires an explicit output fixture"
+                )
+
+        if isinstance(tool_outputs, types.ModuleType):
+            fn = getattr(tool_outputs, name, None)
+            if fn is None:
+                continue
+            try:
+                kwargs = json.loads(call.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                kwargs = {}
+            result = fn(**kwargs)
+            if result is None:
+                continue
+            if isinstance(result, str) or _is_content_part_list(result):
+                # A string is the plain tool result; a list of typed content
+                # parts (input_text / input_image / input_file) is the
+                # structured Responses output and must stay an array.
+                output = result
+            else:
+                output = json.dumps(result)
+        else:
+            if name not in tool_outputs:
+                continue
+            output = tool_outputs[name]
+        input_items.append(
+            {
+                "type": (
+                    "custom_tool_call_output"
+                    if call_type == "custom_tool_call"
+                    else "function_call_output"
+                ),
+                "call_id": call_id,
+                "output": output,
+            }
+        )
+
+    if user_prompt:
+        input_items.append(
+            {"type": "message", "role": "user", "content": user_prompt}
+        )
+    return input_items
+
+
+def _report_tool_output_injection(tool_calls: list[dict], input_items: list[dict]) -> None:
+    submitted_ids = {
+        item["call_id"]
+        for item in input_items
+        if isinstance(item, dict) and isinstance(item.get("call_id"), str)
+    }
+    click.echo(
+        f"  [injecting {len(submitted_ids)}/{len(tool_calls)} client-tool output(s) before user message]"
+    )
+    for call in tool_calls:
+        if call.get("call_id") not in submitted_ids:
+            click.echo(
+                f"  [no scripted output for {call.get('type')} {call.get('name', '')!r} "
+                f"(call_id={call.get('call_id')})]",
+                err=True,
+            )
+
+
+def run_conv(
+    client: httpx.Client,
+    turns: int,
+    model: str,
+    stream: bool,
+    store: bool,
+    branches: list[tuple[int, int | None]],
+    proxy_url: str,
+) -> None:
+    conv_id = _create_conversation(client, proxy_url)
+    response_ids: dict[int, str] = {}
+    # map: branch_turn_number -> branch_from (which turn's response to use as previous)
+    branch_map: dict[int, int] = {}
+    extra_branches: list[int] = []  # branch_from values with no branch_turn_number
+    for branch_from, branch_turn_number in branches:
+        if branch_turn_number is not None:
+            branch_map[branch_turn_number] = branch_from
+        else:
+            extra_branches.append(branch_from)
+
+    previous_response_id: str | None = None
+    for turn in range(1, turns + 1):
+        if turn in branch_map:
+            branch_from = branch_map[turn]
+            if branch_from not in response_ids:
+                raise click.UsageError(
+                    f"--branch-from {branch_from} at turn {turn} has no recorded response "
+                    f"(available: {sorted(response_ids)})"
+                )
+            previous_response_id = response_ids[branch_from]
+            click.echo(
+                f"\n[Branch] turn {turn} chains from turn {branch_from} (response_id={previous_response_id})"
+            )
+        prompt = _prompt(f"Turn {turn}/{turns} — enter prompt: ")
+        body: dict = {"model": model, "input": prompt, "stream": stream, "store": store}
+        if previous_response_id:
+            body["previous_response_id"] = previous_response_id
+        else:
+            body["conversation"] = conv_id
+        response_data = _send(client, body, stream, proxy_url)
+        response_id = response_data.get("id") if response_data else None
+        if response_id:
+            response_ids[turn] = response_id
+            previous_response_id = response_id
+
+    # branches without a branch_turn_number get one extra turn each
+    for b_idx, branch_from in enumerate(extra_branches, start=1):
+        if branch_from not in response_ids:
+            raise click.UsageError(
+                f"Extra branch {b_idx}: --branch-from {branch_from} has no recorded response "
+                f"(available: {sorted(response_ids)})"
+            )
+        branch_resp_id = response_ids[branch_from]
+        click.echo(
+            f"\n[Extra branch {b_idx}] from turn {branch_from} (response_id={branch_resp_id}), turn {turns + 1}"
+        )
+        prompt = _prompt(
+            f"Turn {turns + 1} (extra branch from turn {branch_from}) — enter prompt: "
+        )
+        body = {
+            "model": model,
+            "input": prompt,
+            "stream": stream,
+            "store": store,
+            "previous_response_id": branch_resp_id,
+            "conversation": conv_id,
+        }
+        _send(client, body, stream, proxy_url)
+
+
+def run_isolation(
+    client: httpx.Client,
+    turns: int,
+    model: str,
+    stream: bool,
+    store: bool,
+    proxy_url: str,
+) -> None:
+    for conv_label in ("A", "B"):
+        click.echo(f"\n--- Conversation {conv_label} ({turns} turns) ---")
+        conv_id = _create_conversation(client, proxy_url)
+        for turn in range(1, turns + 1):
+            prompt = _prompt(
+                f"Conv {conv_label} | Turn {turn}/{turns} — enter prompt: "
+            )
+            body: dict = {
+                "model": model,
+                "input": prompt,
+                "stream": stream,
+                "store": store,
+                "conversation": conv_id,
+            }
+            _send(client, body, stream, proxy_url)
+
+
+def run_store_true_then_store_false(
+    client: httpx.Client,
+    turns: int,
+    model: str,
+    stream: bool,
+    proxy_url: str,
+) -> None:
+    """Turn 1: store=true with conversation_id. Remaining turns: store=false, still pass conversation_id."""
+    conv_id = _create_conversation(client, proxy_url)
+    for turn in range(1, turns + 1):
+        store_turn = turn == 1
+        prompt = _prompt(f"Turn {turn}/{turns} — enter prompt: ")
+        body: dict = {
+            "model": model,
+            "input": prompt,
+            "stream": stream,
+            "store": store_turn,
+            "conversation": conv_id,
+        }
+        _send(client, body, stream, proxy_url)
+
+
+def run_mixed(
+    client: httpx.Client,
+    turns: int,
+    model: str,
+    stream: bool,
+    store: bool,
+    proxy_url: str,
+) -> None:
+    conv_id = _create_conversation(client, proxy_url)
+    previous_response_id: str | None = None
+
+    for turn in range(1, turns + 1):
+        prompt = _prompt(f"Turn {turn}/{turns} — enter prompt: ")
+        body: dict = {"model": model, "input": prompt, "stream": stream, "store": store}
+        if previous_response_id:
+            body["previous_response_id"] = previous_response_id
+        else:
+            body["conversation"] = conv_id
+        response_data = _send(client, body, stream, proxy_url)
+        previous_response_id = response_data.get("id") if response_data else None
+
+
+def run_messages(
+    client: httpx.Client,
+    turns: int,
+    model: str,
+    stream: bool,
+    proxy_url: str,
+    tools: list | None,
+    tool_choice: Any,
+    tool_outputs: dict[str, str] | None,
+    max_tokens: int,
+) -> None:
+    """Record Anthropic Messages turns.
+
+    Messages is stateless: the client resends the full `messages` history each
+    turn. Between turns we append the model's assistant `content` and — for any
+    `tool_use` block — a matching `tool_result` block (fake output from
+    `--tool-outputs`, keyed by tool name), mirroring how a gateway tool loop
+    feeds results back. A turn with pending tool_use consumes those outputs
+    instead of prompting for a new user message.
+    """
+    history: list[dict] = []
+    for turn in range(1, turns + 1):
+        pending_tool_use = [
+            b
+            for msg in history[-1:]
+            if msg.get("role") == "assistant"
+            for b in (msg.get("content") or [])
+            if isinstance(b, dict) and b.get("type") == "tool_use"
+        ]
+        if pending_tool_use and tool_outputs:
+            # Feed tool_result blocks back for the prior turn's tool_use calls.
+            results = []
+            for call in pending_tool_use:
+                out = tool_outputs.get(call.get("name"), "{}")
+                results.append(
+                    {"type": "tool_result", "tool_use_id": call.get("id"), "content": out, "is_error": False}
+                )
+            history.append({"role": "user", "content": results})
+            click.echo(f"  [fed back {len(results)} tool_result(s) for {[c.get('name') for c in pending_tool_use]}]")
+        else:
+            prompt = _prompt(f"Turn {turn}/{turns} — enter prompt: ")
+            history.append({"role": "user", "content": prompt})
+
+        body: dict = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": history,
+            "stream": stream,
+        }
+        if tools is not None:
+            body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+
+        message = (
+            _send_messages_streaming(client, body, proxy_url)
+            if stream
+            else _send_messages_nonstreaming(client, body, proxy_url)
+        )
+        if not message:
+            click.echo("  [no message returned — stopping]")
+            break
+        # Append the assistant turn so the next request carries full history.
+        history.append({"role": "assistant", "content": message.get("content", [])})
+
+
+def run_responses(
+    client: httpx.Client,
+    turns: int,
+    model: str,
+    stream: bool,
+    store: bool,
+    branches: list[tuple[int, int | None]],
+    proxy_url: str,
+    transport: str = "http",
+    target_base_url: str = "",
+    headers: dict[str, str] | None = None,
+    output_file: Path | None = None,
+    tools: list | None = None,
+    tool_choice: Any = None,
+    tool_choice_sequence: list[Any] | None = None,
+    tool_outputs: "dict[str, Any] | types.ModuleType | None" = None,
+    tool_search_output_tools: list[dict] | None = None,
+    tools_after_search: list | None = None,
+    max_output_tokens: int | None = None,
+    reasoning: dict | None = None,
+    preset_input: str | list | None = None,
+    manual_item_replay: bool = False,
+    parallel_tool_calls: bool | None = None,
+    multi_agent: dict | None = None,
+    request_overrides: dict | None = None,
+    auto_tool_continuations: int = 0,
+    max_tool_calls: list[int | None] | int | None = None,
+) -> list[dict] | None:
+    if transport == "websocket" and multi_agent is not None:
+        from websocket_recorder import RecordedSession, exchange
+
+        if branches or manual_item_replay or tool_choice_sequence or request_overrides:
+            raise click.UsageError("multi-agent WebSocket capture does not support branching or request overrides")
+        if output_file is None:
+            raise ValueError("WebSocket recording needs an output file")
+        url = _websocket_url(target_base_url)
+        ws = WebSocketClient(url, headers or {})
+        handshake = {"request": {"method": "GET", "url": url, "headers": _filter_request_headers(headers or {})}}
+        output_builder = lambda calls: _build_tool_output_input(calls, tool_outputs or {}, None, tool_search_output_tools)
+        with RecordedSession(ws, output_file, handshake, HTTP_READ_TIMEOUT) as session:
+            previous_id = None
+            for prompt_turn in range(turns):
+                value = preset_input if prompt_turn == 0 and preset_input is not None else _prompt(
+                    f"Turn {prompt_turn + 1}/{turns} — enter prompt: "
+                )
+                body = {"model": model, "input": value, "store": store, "multi_agent": multi_agent}
+                if previous_id is not None:
+                    body["previous_response_id"] = previous_id
+                if max_output_tokens is not None:
+                    body["max_output_tokens"] = max_output_tokens
+                if reasoning is not None:
+                    body["reasoning"] = reasoning
+                _inject_tools(body, tools, tool_choice, parallel_tool_calls)
+                for continuation in range(auto_tool_continuations + 1):
+                    response, returned = exchange(session, body, output_builder, inject=True)
+                    previous_id = response["id"]
+                    if not returned:
+                        break
+                    if continuation == auto_tool_continuations:
+                        raise click.ClickException("completed-response fallback exceeded continuation budget")
+                    body = dict(body, previous_response_id=previous_id, input=returned)
+                click.echo(f"  [WebSocket response {previous_id}; all injection outcomes received]")
+        return
+
+    response_ids: dict[int, str] = {}
+    responses: dict[int, dict] = {}
+    branch_map: dict[int, int] = {}
+    extra_branches: list[int] = []
+    for branch_from, branch_turn_number in branches:
+        if branch_turn_number is not None:
+            branch_map[branch_turn_number] = branch_from
+        else:
+            extra_branches.append(branch_from)
+
+    previous_response_id: str | None = None
+    last_response: dict | None = None
+    search_tools_loaded = False
+    manual_history: list[dict] = []
+    prompt_turn = 0
+    automatic_turns = 0
+    for turn in range(1, turns + auto_tool_continuations + 1):
+        # Finish pending client work before reading the next scripted user prompt.
+        automatic = bool(auto_tool_continuations and _extract_tool_calls(last_response))
+        if automatic:
+            if automatic_turns >= auto_tool_continuations:
+                break
+            automatic_turns += 1
+        else:
+            if prompt_turn >= turns:
+                break
+            prompt_turn += 1
+        if turn in branch_map:
+            branch_from = branch_map[turn]
+            if branch_from not in response_ids:
+                raise click.UsageError(
+                    f"--branch-from {branch_from} at turn {turn} has no recorded response "
+                    f"(available: {sorted(response_ids)})"
+                )
+            previous_response_id = response_ids[branch_from]
+            last_response = responses.get(branch_from)
+            click.echo(
+                f"\n[Branch] turn {turn} chains from turn {branch_from} (response_id={previous_response_id})"
+            )
+        if preset_input is not None and turn == 1:
+            # The preset value replaces the first prompt only; later turns are
+            # typed as usual so a structured opening turn (for example an
+            # input_image item array) can still be continued by previous_response_id.
+            input_value: Any = preset_input
+        else:
+            prompt = "" if automatic else _prompt(f"Turn {prompt_turn}/{turns} — enter prompt: ")
+            if automatic:
+                click.echo(f"  [automatic client-tool continuation {automatic_turns}/{auto_tool_continuations}]")
+
+            # Inject matching client-tool outputs before the user message.
+            has_output_fixtures = (
+                tool_outputs is not None or tool_search_output_tools is not None
+            )
+            pending_calls = (
+                _extract_tool_calls(last_response) if has_output_fixtures else []
+            )
+            if pending_calls:
+                search_tools_loaded = search_tools_loaded or any(
+                    call.get("type") == "tool_search_call"
+                    or (
+                        call.get("type") == "function_call"
+                        and call.get("name") == "tool_search"
+                    )
+                    for call in pending_calls
+                )
+                input_value = _build_tool_output_input(
+                    pending_calls,
+                    tool_outputs or {},
+                    prompt if prompt else None,
+                    tool_search_output_tools,
+                )
+                _report_tool_output_injection(pending_calls, input_value)
+            else:
+                input_value = prompt
+
+        if manual_item_replay:
+            if isinstance(input_value, str):
+                new_input_items = [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": input_value,
+                    }
+                ]
+            elif isinstance(input_value, list):
+                new_input_items = copy.deepcopy(input_value)
+            else:
+                raise ValueError("manual item replay input must be a string or item array")
+            manual_history.extend(new_input_items)
+            input_value = copy.deepcopy(manual_history)
+
+        body: dict = {"model": model, "input": input_value, "stream": stream, "store": store}
+        if multi_agent is not None:
+            body["multi_agent"] = multi_agent
+        if max_output_tokens is not None:
+            body["max_output_tokens"] = max_output_tokens
+        if reasoning is not None:
+            body["reasoning"] = reasoning
+        if previous_response_id and store:
+            body["previous_response_id"] = previous_response_id
+        effective_tools = tools_after_search if search_tools_loaded else tools
+        if auto_tool_continuations and tools_after_search is None:
+            effective_tools = tools
+        turn_tool_choice = tool_choice_sequence[turn - 1] if tool_choice_sequence is not None else tool_choice
+        effective_parallel_tool_calls = (
+            False if tool_search_output_tools is not None and not auto_tool_continuations
+            else parallel_tool_calls
+        )
+        _inject_tools(body, effective_tools, turn_tool_choice, effective_parallel_tool_calls)
+        turn_max_tool_calls = _max_tool_calls_for_turn(max_tool_calls, turn)
+        if turn_max_tool_calls is not None:
+            body["max_tool_calls"] = turn_max_tool_calls
+        if request_overrides is not None:
+            # Characterization must send invalid/null values without repairing them.
+            body.update(request_overrides)
+        response_data = _send(
+            client,
+            body,
+            stream,
+            proxy_url,
+            transport,
+            target_base_url,
+            headers,
+            output_file,
+        )
+        response_id = response_data.get("id") if response_data else None
+        if manual_item_replay:
+            response_output = response_data.get("output") if response_data else None
+            if not isinstance(response_output, list):
+                raise ValueError(
+                    "manual item replay requires every response to contain an output array"
+                )
+            manual_history.extend(copy.deepcopy(response_output))
+        previous_response_id = response_id if store else None
+        last_response = response_data
+        if response_id:
+            response_ids[turn] = response_id
+            responses[turn] = response_data
+
+    if auto_tool_continuations and _extract_tool_calls(last_response):
+        raise click.ClickException(
+            f"Client-tool continuation limit ({auto_tool_continuations}) reached; "
+            "pending calls remain. Captured responses are retained; the task is unfinished."
+        )
+
+    for b_idx, branch_from in enumerate(extra_branches, start=1):
+        if branch_from not in response_ids:
+            raise click.UsageError(
+                f"Extra branch {b_idx}: --branch-from {branch_from} has no recorded response "
+                f"(available: {sorted(response_ids)})"
+            )
+        branch_resp_id = response_ids[branch_from]
+        branch_response = responses.get(branch_from)
+        click.echo(
+            f"\n[Extra branch {b_idx}] from turn {branch_from} (response_id={branch_resp_id}), turn {turns + 1}"
+        )
+        prompt = _prompt(
+            f"Turn {turns + 1} (extra branch from turn {branch_from}) — enter prompt: "
+        )
+
+        pending_calls = _extract_tool_calls(branch_response) if tool_outputs else []
+        if pending_calls and tool_outputs:
+            input_value = _build_tool_output_input(pending_calls, tool_outputs, prompt if prompt else None)
+            _report_tool_output_injection(pending_calls, input_value)
+        else:
+            input_value = prompt
+
+        body = {
+            "model": model,
+            "input": input_value,
+            "stream": stream,
+            "store": store,
+            "previous_response_id": branch_resp_id,
+        }
+        if multi_agent is not None:
+            body["multi_agent"] = multi_agent
+        if max_output_tokens is not None:
+            body["max_output_tokens"] = max_output_tokens
+        if reasoning is not None:
+            body["reasoning"] = reasoning
+        _inject_tools(body, tools, tool_choice, parallel_tool_calls)
+        _send(
+            client,
+            body,
+            stream,
+            proxy_url,
+            transport,
+            target_base_url,
+            headers,
+            output_file,
+        )
+
+    # Let a scenario continue the same stateless conversation with different declarations.
+    return manual_history if manual_item_replay else None
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--auto-tool-continuations", type=click.IntRange(0, 100), default=0,
+              help="Maximum additional tool-output-only Responses requests after scripted turns.")
+@click.option(
+    "--turns", "-n", required=True, type=int, help="Number of turns to record."
+)
+@click.option(
+    "--output",
+    "-o",
+    required=True,
+    type=click.Path(),
+    help="Output cassette YAML path.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["conv", "isolation", "mixed", "responses", "messages", "store_true_then_store_false", "items"]),
+    default="conv",
+    show_default=True,
+    help="Recording mode.",
+)
+@click.option(
+    "--items-scenario",
+    type=click.Choice(["continuation", "branch", "deletion", "pagination", "edge-cases", "concurrent-writes", "stale-compaction", *COMPACTION_SCENARIOS, "competing-tool-outputs", "overlapping-multi-agent", "store-false", "multi-agent-store-false", "response-lifecycle", "response-pagination", "response-edge-cases", "response-conversation", "response-replayed-items", "response-tool-items", "response-call-ids"]),
+    default="continuation",
+    help="Fixed Conversation Items or Responses API scenario (for --mode items).",
+)
+@click.option(
+    "--branch-from",
+    type=int,
+    multiple=True,
+    metavar="TURN",
+    help="Rewind to this turn's response (repeatable, one per branch).",
+)
+@click.option(
+    "--branch-turn-number",
+    type=int,
+    multiple=True,
+    metavar="TURN",
+    help="First turn number for the corresponding branch (repeatable, pairs with --branch-from).",
+)
+@click.option(
+    "--stream/--no-stream",
+    default=True,
+    show_default=True,
+    help="Use streaming responses.",
+)
+@click.option(
+    "--transport",
+    type=click.Choice(["http", "websocket"]),
+    default="http",
+    show_default=True,
+    help="Wire transport to record. websocket is supported for --mode responses.",
+)
+@click.option(
+    "--model", default=MODEL, show_default=True, help="Model name to pass in requests."
+)
+@click.option(
+    "--no-store", is_flag=True, default=False, help="Set store=false in requests."
+)
+@click.option(
+    "--proxy-port",
+    type=int,
+    default=PROXY_PORT,
+    show_default=True,
+    help="Local port for the embedded recording proxy.",
+)
+@click.option(
+    "--openai",
+    "openai_url",
+    metavar="URL",
+    default=None,
+    help="OpenAI upstream URL (default https://api.openai.com). Reads OPENAI_API_KEY.",
+)
+@click.option(
+    "--vllm",
+    "vllm_url",
+    metavar="URL",
+    default=None,
+    help="vLLM upstream URL, e.g. http://localhost:8000 (responses mode only, no auth).",
+)
+@click.option(
+    "--gateway",
+    "gateway_url",
+    metavar="URL",
+    default=None,
+    help="agentic-api gateway URL, e.g. http://localhost:9000 (no auth).",
+)
+@click.option(
+    "--tools",
+    "tools_file",
+    metavar="FILE",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to a JSON file containing a tools array to inject into every request.",
+)
+@click.option(
+    "--tool-choice",
+    "tool_choice_raw",
+    metavar="VALUE",
+    default=None,
+    help='tool_choice value: "auto", "none", "required", or JSON e.g. \'{"type":"function","name":"foo"}\'.',
+)
+@click.option(
+    "--tool-choice-sequence",
+    "tool_choice_sequence_file",
+    metavar="FILE",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON array containing one tool_choice value per linear Responses turn.",
+)
+@click.option(
+    "--parallel-tool-calls",
+    "parallel_tool_calls_raw",
+    type=click.Choice(["true", "false"]),
+    default=None,
+    help="parallel_tool_calls value to send on Responses requests (omit to use the API default).",
+)
+@click.option(
+    "--tool-outputs",
+    "tool_outputs_file",
+    metavar="FILE",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to a *.json file mapping tool names to fake output strings, or a *.py file defining "
+    "one function per tool name (called with the model's actual parsed arguments; returning None "
+    "omits that call's output). When provided, matching function_call_output or "
+    "custom_tool_call_output items are injected between turns (required for OpenAI Responses API). "
+    "Shell calls use the key/function shell (called with action=...) returning an object with "
+    "an output array and optional max_output_length for shell_call_output.",
+)
+@click.option(
+    "--tool-search-output-tools",
+    "tool_search_output_tools_file",
+    metavar="FILE",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON array returned by a client tool-search continuation.",
+)
+@click.option(
+    "--tools-after-search",
+    "tools_after_search_file",
+    metavar="FILE",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Effective JSON tools array used after search (required for direct vLLM characterization).",
+)
+@click.option(
+    "--manual-item-replay",
+    is_flag=True,
+    default=False,
+    help="Replay full accumulated item history with store=false over HTTP Responses.",
+)
+@click.option(
+    "--input-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "JSON file containing the Responses input value for turn 1; later turns are prompted. "
+        "Requires HTTP --mode responses without branches."
+    ),
+)
+@click.option(
+    "--reasoning",
+    "reasoning_raw",
+    metavar="JSON",
+    default=None,
+    help='Responses reasoning settings as a JSON object, e.g. \'{"effort":"high","summary":"detailed"}\'.',
+)
+@click.option(
+    "--multi-agent",
+    "multi_agent_raw",
+    metavar="JSON",
+    default=None,
+    help='Multi-agent settings as a JSON object, e.g. \'{"enabled":true,"max_concurrent_subagents":3}\'. '
+    "HTTP Responses only. Does not add the beta header; use --openai-beta responses_multi_agent=v1.",
+)
+@click.option(
+    "--openai-beta",
+    multiple=True,
+    metavar="VALUE",
+    help="OpenAI-Beta header value (repeatable, comma-separated on the wire). HTTP Responses only. "
+    "Independent of --multi-agent so missing or incorrect beta headers can be characterized.",
+)
+@click.option(
+    "--request-overrides",
+    "request_overrides_raw",
+    metavar="JSON",
+    default=None,
+    help="Override request body fields verbatim for HTTP Responses characterization. "
+    "Requires --turns 1 without branches; accepts invalid API values for negative recordings.",
+)
+@click.option(
+    "--http-read-timeout",
+    type=click.IntRange(min=1),
+    default=TIMEOUT,
+    show_default=True,
+    help="Upstream read inactivity timeout in seconds for HTTP Responses recording; not a total duration limit.",
+)
+@click.option(
+    "--max-output-tokens",
+    type=int,
+    default=1024,
+    show_default=True,
+    help="max_output_tokens for Responses requests. Use 0 to omit the field.",
+)
+@click.option(
+    "--max-tool-calls",
+    "max_tool_calls_raw",
+    metavar="JSON",
+    default=None,
+    help="max_tool_calls for linear Responses turns: an integer sent on every turn, or a JSON array with one "
+    "entry per turn where null omits the field (e.g. '[1, null]'). The value is sent unvalidated.",
+)
+@click.option(
+    "--append",
+    is_flag=True,
+    default=False,
+    help="Append turns to an existing --output file instead of truncating it first. Lets multiple "
+    "independent invocations (e.g. separate conversation branches that each end in a provider error) "
+    "accumulate into one cassette. HTTP --mode responses only.",
+)
+def main(
+    turns: int,
+    auto_tool_continuations: int,
+    output: str,
+    mode: str,
+    branch_from: tuple[int, ...],
+    items_scenario: str,
+    branch_turn_number: tuple[int, ...],
+    stream: bool,
+    transport: str,
+    model: str,
+    no_store: bool,
+    proxy_port: int,
+    openai_url: str | None,
+    vllm_url: str | None,
+    gateway_url: str | None,
+    tools_file: str | None,
+    tool_choice_raw: str | None,
+    tool_choice_sequence_file: str | None,
+    parallel_tool_calls_raw: str | None,
+    tool_outputs_file: str | None,
+    tool_search_output_tools_file: str | None,
+    tools_after_search_file: str | None,
+    manual_item_replay: bool,
+    input_file: str | None,
+    reasoning_raw: str | None,
+    multi_agent_raw: str | None,
+    openai_beta: tuple[str, ...],
+    request_overrides_raw: str | None,
+    http_read_timeout: int,
+    max_output_tokens: int,
+    max_tool_calls_raw: str | None,
+    append: bool,
+) -> None:
+    """Interactive multi-turn cassette recorder (proxy embedded)."""
+    global HTTP_READ_TIMEOUT
+    if auto_tool_continuations and (
+        mode != "responses" or (no_store and not manual_item_replay) or not tool_outputs_file
+        or branch_from or branch_turn_number or tool_choice_sequence_file or request_overrides_raw
+    ):
+        raise click.UsageError(
+            "--auto-tool-continuations requires Responses with --tool-outputs and either storage or --manual-item-replay, "
+            "without branches, tool-choice sequences, or request overrides."
+        )
+    if http_read_timeout != TIMEOUT and mode not in {"responses", "items"}:
+        raise click.UsageError("--http-read-timeout requires --mode responses or items.")
+    HTTP_READ_TIMEOUT = http_read_timeout
+    if (multi_agent_raw is not None or openai_beta) and mode != "responses":
+        raise click.UsageError("--multi-agent and --openai-beta require --mode responses.")
+    for beta in openai_beta:
+        if not beta.strip() or any(ord(char) < 32 or ord(char) >= 127 for char in beta):
+            raise click.UsageError("--openai-beta must be a nonempty printable ASCII header value.")
+    multi_agent = _parse_multi_agent(multi_agent_raw)
+    request_overrides = None
+    if request_overrides_raw is not None:
+        if mode != "responses" or transport != "http" or turns != 1 or branch_from or branch_turn_number:
+            raise click.UsageError("--request-overrides requires HTTP --mode responses --turns 1 without branches.")
+        try:
+            request_overrides = json.loads(request_overrides_raw)
+        except json.JSONDecodeError as error:
+            raise click.UsageError(f"--request-overrides is not valid JSON: {error}") from error
+        if not isinstance(request_overrides, dict):
+            raise click.UsageError("--request-overrides must contain a JSON object.")
+        if "stream" in request_overrides:
+            raise click.UsageError("Use --stream/--no-stream instead of overriding stream.")
+    max_tool_calls = _parse_max_tool_calls(max_tool_calls_raw)
+    if max_tool_calls is not None and (mode != "responses" or branch_from or branch_turn_number):
+        raise click.UsageError("--max-tool-calls requires linear --mode responses without branches.")
+
+    if mode == "items":
+        expected_turns = (1 if items_scenario == "multi-agent-store-false" else
+                          11 if items_scenario == "store-false" else
+                          19 if items_scenario == "response-lifecycle" else
+                          16 if items_scenario == "response-pagination" else
+                          23 if items_scenario == "response-edge-cases" else
+                          19 if items_scenario == "response-conversation" else
+                          14 if items_scenario == "response-replayed-items" else
+                          48 if items_scenario == "response-tool-items" else
+                          17 if items_scenario == "response-call-ids" else
+                          10 if items_scenario == "pagination" else
+                          6 if items_scenario == "branch" else
+                          19 if items_scenario == "edge-cases" else
+                          22 if items_scenario == "concurrent-writes" else
+                          10 if items_scenario == "stale-compaction" else
+                          COMPACTION_SCENARIOS[items_scenario][1] if items_scenario in COMPACTION_SCENARIOS else
+                          9 if items_scenario == "competing-tool-outputs" else
+                          7 if items_scenario == "overlapping-multi-agent" else 5)
+        if turns != expected_turns:
+            raise click.UsageError(
+                f"--mode items --items-scenario {items_scenario} requires --turns {expected_turns}."
+            )
+        if append:
+            raise click.UsageError("--mode items does not support --append.")
+    if mode == "items" and branch_from:
+        raise click.UsageError("--mode items has scripted branches; omit --branch-from.")
+    if branch_turn_number and not branch_from:
+        raise click.UsageError("--branch-turn-number requires --branch-from.")
+    if len(branch_turn_number) > len(branch_from):
+        raise click.UsageError(
+            "More --branch-turn-number values than --branch-from values."
+        )
+    # Pair each branch-from with its branch-turn-number (None if not provided)
+    branches: list[tuple[int, int | None]] = [
+        (bf, branch_turn_number[i] if i < len(branch_turn_number) else None)
+        for i, bf in enumerate(branch_from)
+    ]
+    tool_search_recording = (
+        tool_search_output_tools_file is not None
+        or tools_after_search_file is not None
+    )
+    if tools_after_search_file and not tool_search_output_tools_file:
+        raise click.UsageError(
+            "--tools-after-search requires --tool-search-output-tools."
+        )
+    if manual_item_replay and (mode != "responses" or transport != "http" or not no_store or branches):
+        raise click.UsageError(
+            "--manual-item-replay requires HTTP --mode responses with --no-store and no branches."
+        )
+    if tool_search_recording:
+        if mode != "responses":
+            raise click.UsageError(
+                "tool-search recorder fixtures require --mode responses."
+            )
+        if not auto_tool_continuations and turns != 4:
+            raise click.UsageError(
+                "tool-search recorder fixtures require exactly --turns 4."
+            )
+        if branches:
+            raise click.UsageError(
+                "tool-search recorder fixtures do not support --branch-from."
+            )
+        if no_store and not manual_item_replay:
+            raise click.UsageError(
+                "store=false tool-search characterization requires --manual-item-replay."
+            )
+        if input_file:
+            raise click.UsageError(
+                "tool-search recorder fixtures do not support --input-file."
+            )
+        if not tools_file or not tool_outputs_file:
+            raise click.UsageError(
+                "tool-search recording requires --tools and --tool-outputs."
+            )
+        if not auto_tool_continuations and not tool_choice_sequence_file:
+            raise click.UsageError(
+                "tool-search recording requires --tool-choice-sequence."
+            )
+    if tool_choice_raw and tool_choice_sequence_file:
+        raise click.UsageError(
+            "--tool-choice and --tool-choice-sequence are mutually exclusive."
+        )
+    if tool_choice_sequence_file and (mode != "responses" or branches):
+        raise click.UsageError(
+            "--tool-choice-sequence requires linear --mode responses without branches."
+        )
+    backend_count = sum(bool(url) for url in (openai_url, vllm_url, gateway_url))
+    if backend_count > 1:
+        raise click.UsageError("--openai, --vllm, and --gateway are mutually exclusive.")
+    if vllm_url and mode not in ("responses", "messages"):
+        raise click.UsageError(
+            f"--vllm is only supported with --mode responses or --mode messages (got --mode {mode})."
+        )
+    if transport == "websocket" and mode != "responses":
+        raise click.UsageError(
+            f"--transport websocket is only supported with --mode responses (got --mode {mode})."
+        )
+    if max_output_tokens < 0:
+        raise click.UsageError("--max-output-tokens must be >= 0.")
+    if input_file and (mode != "responses" or branches or transport != "http"):
+        raise click.UsageError(
+            "--input-file requires HTTP --mode responses without branches."
+        )
+    if reasoning_raw is not None and mode != "responses":
+        raise click.UsageError("--reasoning is only supported with --mode responses.")
+    preset_input = _load_response_input(input_file)
+    reasoning = _parse_reasoning(reasoning_raw)
+
+    tools: list | None = None
+    if tools_file:
+        tools = _load_tools_file(tools_file)
+
+    tool_choice: Any = None
+    if tool_choice_raw:
+        stripped = tool_choice_raw.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            tool_choice = json.loads(stripped)
+        else:
+            tool_choice = stripped
+
+    tool_choice_sequence: list[Any] | None = None
+    if tool_choice_sequence_file:
+        with open(tool_choice_sequence_file, encoding="utf-8") as f:
+            tool_choice_sequence = json.load(f)
+        if not isinstance(tool_choice_sequence, list) or len(tool_choice_sequence) != turns:
+            raise click.UsageError(
+                "--tool-choice-sequence must contain one JSON value per turn."
+            )
+
+    parallel_tool_calls: bool | None = None
+    if parallel_tool_calls_raw is not None:
+        parallel_tool_calls = parallel_tool_calls_raw == "true"
+
+    tool_outputs: "dict[str, Any] | types.ModuleType | None" = None
+    if tool_outputs_file:
+        tool_outputs = _load_tool_outputs_file(tool_outputs_file)
+        if isinstance(tool_outputs, types.ModuleType):
+            click.echo(f"Tool outputs: python functions from {tool_outputs_file}")
+        else:
+            click.echo(f"Tool outputs: {list(tool_outputs.keys())}")
+
+    tool_search_output_tools: list[dict] | None = None
+    if tool_search_output_tools_file:
+        with open(tool_search_output_tools_file, encoding="utf-8") as f:
+            tool_search_output_tools = json.load(f)
+        if not isinstance(tool_search_output_tools, list) or not all(
+            isinstance(tool, dict) for tool in tool_search_output_tools
+        ):
+            raise click.UsageError(
+                "--tool-search-output-tools must contain a JSON array of objects."
+            )
+        if not tool_search_output_tools:
+            raise click.UsageError(
+                "--tool-search-output-tools must contain at least one tool."
+            )
+
+    tools_after_search: list | None = None
+    if tools_after_search_file:
+        with open(tools_after_search_file, encoding="utf-8") as f:
+            tools_after_search = json.load(f)
+        if not isinstance(tools_after_search, list):
+            raise click.UsageError(
+                "--tools-after-search must contain a JSON array."
+            )
+
+    if tool_search_recording and vllm_url and tools_after_search is None:
+        raise click.UsageError(
+            "direct vLLM tool-search characterization requires --tools-after-search."
+        )
+    if tool_search_recording and vllm_url and not manual_item_replay:
+        raise click.UsageError(
+            "direct vLLM tool-search characterization requires --manual-item-replay."
+        )
+    if tool_search_recording and not (vllm_url or gateway_url) and manual_item_replay:
+        raise click.UsageError(
+            "--manual-item-replay is reserved for direct vLLM or gateway tool-search recording."
+        )
+
+    if gateway_url:
+        target = gateway_url.rstrip("/")
+        gateway_api_key = os.environ.get("GATEWAY_API_KEY", "")
+        headers = {"Authorization": f"Bearer {gateway_api_key}"} if gateway_api_key else {}
+        backend_label = f"Gateway: {target}"
+    elif vllm_url:
+        target = vllm_url.rstrip("/")
+        headers: dict = {}
+        backend_label = f"vLLM:   {target}"
+    else:
+        target = (openai_url or "https://api.openai.com").rstrip("/")
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise click.ClickException(
+                "OPENAI_API_KEY environment variable is not set."
+            )
+        headers = {"Authorization": f"Bearer {api_key}"}
+        backend_label = f"OpenAI: {target}"
+
+    if openai_beta:
+        headers["OpenAI-Beta"] = ", ".join(openai_beta)
+
+    output_file = Path(output).resolve()
+    proxy_url = f"http://{PROXY_HOST}:{proxy_port}"
+    store = not no_store
+    if transport == "websocket":
+        stream = True
+        store = True
+    response_max_output_tokens = max_output_tokens or None
+
+    click.echo(
+        f"Mode: {mode} | Turns: {turns} | Stream: {stream} | Transport: {transport} | Model: {model} | "
+        f"Max output tokens: {response_max_output_tokens or 'backend default'}"
+    )
+    click.echo(f"Output:  {output_file}")
+    click.echo(backend_label)
+    if transport == "websocket":
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text("", encoding="utf-8")
+        click.echo(f"WebSocket: {_websocket_url(target)}")
+        with httpx.Client(headers=headers) as client:
+            run_responses(
+                client,
+                turns,
+                model,
+                stream,
+                store,
+                branches,
+                proxy_url,
+                transport,
+                target,
+                headers,
+                output_file,
+                tools=tools,
+                tool_choice=tool_choice,
+                tool_choice_sequence=tool_choice_sequence,
+                tool_outputs=tool_outputs,
+                tool_search_output_tools=tool_search_output_tools,
+                tools_after_search=tools_after_search,
+                max_output_tokens=response_max_output_tokens,
+                reasoning=reasoning,
+                preset_input=preset_input,
+                manual_item_replay=manual_item_replay,
+                parallel_tool_calls=parallel_tool_calls,
+                multi_agent=multi_agent,
+                auto_tool_continuations=auto_tool_continuations,
+                request_overrides=request_overrides,
+                max_tool_calls=max_tool_calls,
+            )
+    else:
+        click.echo(f"Proxy:   {proxy_url}  (requests go through here for recording)")
+        server = _start_proxy(output_file, target, proxy_port, append=append)
+        click.echo(f"Proxy ready on {proxy_url}\n")
+
+        try:
+            with httpx.Client(headers=headers) as client:
+                if mode == "items":
+                    run_items(client, proxy_url, model, items_scenario, stream,
+                              max_output_tokens=response_max_output_tokens)
+                elif mode == "conv":
+                    run_conv(client, turns, model, stream, store, branches, proxy_url)
+                elif mode == "isolation":
+                    run_isolation(client, turns, model, stream, store, proxy_url)
+                elif mode == "mixed":
+                    run_mixed(client, turns, model, stream, store, proxy_url)
+                elif mode == "responses":
+                    run_responses(
+                        client,
+                        turns,
+                        model,
+                        stream,
+                        store,
+                        branches,
+                        proxy_url,
+                        transport,
+                        target,
+                        headers,
+                        output_file,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        tool_choice_sequence=tool_choice_sequence,
+                        tool_outputs=tool_outputs,
+                        tool_search_output_tools=tool_search_output_tools,
+                        tools_after_search=tools_after_search,
+                        max_output_tokens=response_max_output_tokens,
+                        reasoning=reasoning,
+                        preset_input=preset_input,
+                        manual_item_replay=manual_item_replay,
+                        parallel_tool_calls=parallel_tool_calls,
+                        multi_agent=multi_agent,
+                        request_overrides=request_overrides,
+                        auto_tool_continuations=auto_tool_continuations,
+                        max_tool_calls=max_tool_calls,
+                    )
+                elif mode == "messages":
+                    run_messages(
+                        client,
+                        turns,
+                        model,
+                        stream,
+                        proxy_url,
+                        tools,
+                        tool_choice,
+                        tool_outputs,
+                        response_max_output_tokens or 1024,
+                    )
+                elif mode == "store_true_then_store_false":
+                    run_store_true_then_store_false(client, turns, model, stream, proxy_url)
+        finally:
+            _stop_proxy(server)
+
+    click.echo(f"\nAll turns recorded -> {output_file}")
+
+
+if __name__ == "__main__":
+    main()

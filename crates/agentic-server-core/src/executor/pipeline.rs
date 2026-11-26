@@ -1,0 +1,270 @@
+//! Request-owned pipeline with a synchronous ingestion core and awaited stream delivery.
+mod ingest;
+
+pub(super) use ingest::RoundIngestion;
+
+use crate::events::{ClassifiedSseLine, EventFrame, SseLine};
+use crate::executor::accumulator::Validation;
+use crate::executor::error::{ExecutorError, ExecutorResult};
+use crate::executor::gateway_accumulator::GatewayStreamAccumulator;
+use crate::executor::multi_agent::RunControlReceiver;
+use crate::executor::relay::{AgentRoundId, StreamRelay};
+use crate::executor::request::RequestContext;
+use crate::executor::response_budget::ExecutorResponseBudget;
+use crate::executor::response_events::ResponseEventSink;
+use crate::executor::telemetry::metrics::ExecutionClock;
+use crate::executor::translate::{Translation, TranslationContext};
+use crate::tool::{ToolRegistry, ToolSearchMetadata, ToolSearchState};
+use crate::types::agent::AgentIdentity;
+use crate::types::io::{InputMessage, OutputItem};
+use crate::types::request_response::ResponsePayload;
+use crate::types::tools::ResponsesTool;
+use futures::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
+
+/// Lives for the response, preserving gateway event numbering across inference rounds.
+pub(super) struct AgentPipeline {
+    pub(super) control: Option<RunControlReceiver>,
+    pub(super) steering: Option<ResponseEventSink>,
+    pub(super) request: RequestContext,
+    tool_search_state: Option<ToolSearchState>,
+    relay: StreamRelay,
+    round: Option<RoundIngestion>,
+    cancellation: CancellationToken,
+    agent_guidance: Option<InputMessage>,
+    /// Set after a `max_tool_calls` refusal; later rounds omit gateway-executed tools.
+    builtin_tools_withheld: bool,
+    /// Timing state of the execution this pipeline serves, when it streams.
+    clock: Option<ExecutionClock>,
+}
+
+impl AgentPipeline {
+    pub(super) fn steering_requested(&self) -> bool {
+        self.steering
+            .as_ref()
+            .is_some_and(ResponseEventSink::steering_requested)
+    }
+
+    /// Report the first upstream line of the execution's streamed bodies to `clock`.
+    pub(super) fn set_execution_clock(&mut self, clock: ExecutionClock) {
+        self.clock = Some(clock);
+    }
+
+    pub(super) fn execution_clock(&self) -> Option<&ExecutionClock> {
+        self.clock.as_ref()
+    }
+
+    pub(super) fn set_agent_guidance(&mut self, guidance: InputMessage) {
+        self.agent_guidance = Some(guidance);
+    }
+
+    pub(super) fn agent_guidance(&self) -> Option<&InputMessage> {
+        self.agent_guidance.as_ref()
+    }
+
+    pub(super) fn withhold_builtin_tools(&mut self) {
+        self.builtin_tools_withheld = true;
+    }
+
+    pub(super) const fn builtin_tools_withheld(&self) -> bool {
+        self.builtin_tools_withheld
+    }
+
+    pub(super) fn has_live_agent_items(&self, agent: &AgentIdentity) -> bool {
+        self.relay.has_live_agent_items(agent)
+    }
+    pub(super) async fn accept_agent_frame(&mut self, source: &AgentRoundId, frame: EventFrame) -> ExecutorResult<()> {
+        self.relay.accept_agent_frame(source, frame).await
+    }
+
+    pub(super) async fn emit_agent_item(&mut self, item: &OutputItem) -> ExecutorResult<usize> {
+        self.relay.emit_agent_item(item).await
+    }
+
+    pub(super) fn finish_agent_source(&mut self, source: &AgentRoundId) {
+        self.relay.finish_agent_source(source);
+    }
+    pub(super) fn is_streaming(&self) -> bool {
+        self.relay.is_live()
+    }
+    pub(super) fn relay_mut(&mut self) -> &mut StreamRelay {
+        &mut self.relay
+    }
+    pub(super) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+    /// One pipeline per response or agent round. The relay's sink decides whether
+    /// and where its frames are presented.
+    pub(super) fn new(request: RequestContext, tool_search_state: Option<ToolSearchState>, relay: StreamRelay) -> Self {
+        Self {
+            request,
+            tool_search_state,
+            relay,
+            round: None,
+            cancellation: CancellationToken::new(),
+            agent_guidance: None,
+            control: None,
+            steering: None,
+            builtin_tools_withheld: false,
+            clock: None,
+        }
+    }
+
+    pub(super) fn tool_search_state(&self) -> Option<&ToolSearchState> {
+        self.tool_search_state.as_ref()
+    }
+
+    /// The search state, from which the registry takes the request's catalog.
+    pub(super) fn tool_search_state_mut(&mut self) -> Option<&mut ToolSearchState> {
+        self.tool_search_state.as_mut()
+    }
+
+    /// Records the public snapshot persistence keeps after the registry loaded searched tools.
+    pub(super) fn record_tool_search_loads(&mut self, effective_tools: Vec<ResponsesTool>, loaded: Vec<ResponsesTool>) {
+        if let Some(state) = self.tool_search_state.as_mut() {
+            state.record_loads(effective_tools, loaded);
+        }
+    }
+
+    pub(super) fn ensure_request_prepared(&self) -> ExecutorResult<()> {
+        crate::tool::tool_search::ensure_request_prepared(
+            &self.request.enriched_request,
+            self.tool_search_state.is_some(),
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn take_tool_search_metadata(&mut self) -> Option<ToolSearchMetadata> {
+        self.tool_search_state
+            .take()
+            .filter(ToolSearchState::is_active)
+            .map(ToolSearchState::into_public_metadata)
+    }
+
+    /// The request beside its relay, for engine steps that present upstream frames.
+    pub(super) fn parts_mut(&mut self) -> (&mut RequestContext, &mut StreamRelay) {
+        (&mut self.request, &mut self.relay)
+    }
+
+    pub(super) fn into_parts(self) -> (RequestContext, GatewayStreamAccumulator) {
+        (self.request, self.relay.into_presentation())
+    }
+
+    fn begin_round(
+        &mut self,
+        validation: Validation,
+        context: TranslationContext,
+        budget: Option<ExecutorResponseBudget>,
+    ) -> ExecutorResult<()> {
+        if self.round.is_some() {
+            return Err(ExecutorError::InvalidRequest(
+                "previous pipeline body did not finish".to_owned(),
+            ));
+        }
+        self.round = Some(RoundIngestion::new(
+            self.request.response_id.clone(),
+            self.request.conversation_id.clone(),
+            validation,
+            context,
+            budget,
+        ));
+        Ok(())
+    }
+
+    fn push(&mut self, line: ClassifiedSseLine) -> ExecutorResult<Translation> {
+        self.round
+            .as_mut()
+            .expect("body runner starts a round before pushing input")
+            .push(line)
+    }
+
+    fn finish(&mut self) -> ExecutorResult<ResponsePayload> {
+        let round = self
+            .round
+            .take()
+            .expect("body runner starts a round before finalization");
+        if self.steering_requested() {
+            round.ensure_steering_settled()?;
+        }
+        let mut payload = round.finish(
+            &self.request.enriched_request.model,
+            self.request.original_request.previous_response_id.as_deref(),
+            self.request.original_request.instructions.as_deref(),
+        )?;
+        self.request.inject_ids(&mut payload);
+        Ok(payload)
+    }
+
+    /// Polls live input inline and awaits delivery before reading another framed line.
+    pub(super) async fn run_with_stream_body(
+        &mut self,
+        body: impl Stream<Item = ExecutorResult<String>>,
+        validation: Validation,
+        context: TranslationContext,
+        registry: &ToolRegistry,
+        output_offset: usize,
+        budget: Option<ExecutorResponseBudget>,
+    ) -> ExecutorResult<ResponsePayload> {
+        self.relay.begin_round(output_offset)?;
+        self.begin_round(validation, context, budget)?;
+        futures::pin_mut!(body);
+        loop {
+            let boundary = self
+                .round
+                .as_ref()
+                .expect("stream runner owns an active ingestion round")
+                .at_steering_boundary();
+            if boundary && self.steering_requested() {
+                self.round
+                    .as_mut()
+                    .expect("stream runner owns an active ingestion round")
+                    .finish_for_steering()?;
+                break;
+            }
+            let line = if let Some(steering) = self.steering.as_ref().filter(|_| boundary) {
+                // Only interrupt the wait when ingestion already owns a safe
+                // boundary. A requested steer during an open item waits for its
+                // completion instead of repeatedly waking this loop.
+                tokio::select! {
+                    biased;
+                    result = steering.wait_steering() => {
+                        result?;
+                        continue;
+                    }
+                    line = body.next() => line,
+                }
+            } else {
+                body.next().await
+            };
+            let Some(line) = line else { break };
+            let line = line?;
+            if let Some(clock) = &self.clock {
+                clock.upstream_data();
+            }
+            let translation = self.push(SseLine::parse(&line))?;
+            self.relay.accept(translation, &self.request, registry).await?;
+        }
+        // Frames still deferred stay with the relay until the engine releases them
+        // around this round's gateway-executed calls.
+        self.finish()
+    }
+
+    /// JSON shares finalization but retains its status instead of applying SSE EOF policy.
+    pub(super) fn run_with_json_body(
+        &mut self,
+        body: &str,
+        validation: Validation,
+        context: TranslationContext,
+        budget: Option<ExecutorResponseBudget>,
+    ) -> ExecutorResult<ResponsePayload> {
+        self.begin_round(validation, context, budget)?;
+        self.round
+            .as_mut()
+            .expect("JSON runner just started its round")
+            .load_json_body(body)?;
+        self.finish()
+    }
+}
+
+#[cfg(test)]
+mod driver_tests;

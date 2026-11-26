@@ -1,0 +1,789 @@
+//! Shared test infrastructure for executor integration tests.
+//!
+//! - [`MockServer`] — axum-based HTTP mock with RAII shutdown (`Drop`).
+//! - [`TestFixture`] — bundles mock server + `ExecutionContext` for one test.
+//! - Cassette loading utilities.
+//! - Response helpers.
+
+#![allow(dead_code)]
+
+pub mod replay;
+
+use std::fmt::Write as _;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use either::Either;
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+
+use agentic_core::executor::{BoxStream, ConversationHandler, ExecutionContext, ResponseHandler};
+use agentic_core::storage::{ConversationStore, DbPool, ResponseStore, create_pool_with_schema};
+use agentic_core::storage::{ResponseMetadata, StoreResult};
+use agentic_core::types::io::InOutItem;
+use agentic_core::types::io::{OutputItem, OutputMessageContent};
+use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
+
+#[derive(Debug, Deserialize)]
+pub struct Cassette<B = TurnBody> {
+    pub turns: Vec<Turn<B>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Turn<B = TurnBody> {
+    #[serde(default)]
+    pub filename: String,
+    pub request: TurnRequest<B>,
+    pub response: TurnResponse,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TurnRequest<B = TurnBody> {
+    #[serde(default)]
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub query_params: Value,
+    pub body: B,
+}
+
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct TurnBody {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default = "default_true")]
+    pub store: bool,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TurnResponse {
+    /// Non-streaming: full JSON response body.
+    pub body: Option<serde_json::Value>,
+    /// Streaming: list of raw SSE strings from the recording.
+    pub sse: Option<Vec<String>>,
+    /// Recorded HTTP status, when the recorder captured one.
+    #[serde(default)]
+    pub status_code: Option<u16>,
+}
+
+/// Load and parse a cassette YAML file (all turns preserved).
+pub fn load_cassette(path: &str) -> Cassette {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read cassette {path}: {e}"));
+    serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("failed to parse cassette {path}: {e}"))
+}
+
+/// Filter to only `/v1/responses` turns — the LLM inference turns that need a
+/// mock HTTP response.  Conversation cassettes interleave `/v1/conversations`
+/// management turns; the Rust executor handles those internally via
+/// [`ConversationHandler`] without any HTTP call.
+pub fn responses_turns(cassette: &Cassette) -> Vec<&Turn> {
+    cassette
+        .turns
+        .iter()
+        .filter(|t| t.request.path == "/v1/responses")
+        .collect()
+}
+
+/// Extract the expected output text from a cassette turn.
+///
+/// - Non-streaming: concatenate message output text, excluding reasoning items.
+/// - Streaming: concatenate all `response.output_text.delta` values
+pub fn expected_text(turn: &Turn) -> String {
+    if let Some(body) = &turn.response.body {
+        return body["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "message")
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter_map(|part| part["text"].as_str())
+            .collect();
+    }
+    if let Some(sse) = &turn.response.sse {
+        let mut out = String::new();
+        for raw in sse {
+            for line in raw.lines() {
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                    && json["type"].as_str() == Some("response.output_text.delta")
+                    && let Some(delta) = json["delta"].as_str()
+                {
+                    out.push_str(delta);
+                }
+            }
+        }
+        return out;
+    }
+    String::new()
+}
+
+/// Parse named SSE JSON events and verify every JSON `data:` line has exactly
+/// one preceding `event:` header matching its payload `type`.
+pub fn named_sse_events<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Value> {
+    let mut event_name = None;
+    let mut events = Vec::new();
+
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("event: ") {
+            assert!(event_name.is_none(), "SSE event header was not followed by data");
+            event_name = Some(name);
+            continue;
+        }
+
+        let data = line.strip_prefix("data: ").expect("unexpected SSE line");
+        if data == "[DONE]" {
+            assert!(event_name.is_none(), "[DONE] must not consume a named event header");
+            continue;
+        }
+
+        let event = serde_json::from_str::<Value>(data).expect("SSE data should be valid JSON");
+        let name = event_name.take().expect("SSE JSON data should have an event header");
+        assert_eq!(event["type"].as_str(), Some(name), "SSE header must match data type");
+        events.push(event);
+    }
+
+    assert!(event_name.is_none(), "SSE event header was not followed by data");
+    events
+}
+
+pub fn recorded_named_sse_events(turn: &Turn) -> Vec<Value> {
+    named_sse_events(
+        turn.response
+            .sse
+            .as_ref()
+            .expect("streaming cassette should contain SSE")
+            .iter()
+            .flat_map(|entry| entry.lines()),
+    )
+}
+
+pub fn streamed_sse_events(chunks: &[String]) -> Vec<Value> {
+    named_sse_events(chunks.iter().flat_map(|chunk| chunk.lines()))
+}
+
+pub fn streamed_sse_event(chunk: &str) -> Option<Value> {
+    let mut events = named_sse_events(chunk.lines());
+    assert!(events.len() <= 1, "stream chunk contained multiple JSON events");
+    events.pop()
+}
+
+/// A per-test HTTP mock server.  The server task is aborted when this struct
+/// is dropped, ensuring clean teardown even if a test panics.
+pub struct MockServer {
+    url: String,
+    handle: JoinHandle<()>,
+    requests: Arc<Mutex<Vec<Value>>>,
+    headers: Arc<Mutex<Vec<http::HeaderMap>>>,
+}
+
+impl MockServer {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub async fn request_bodies(&self) -> Vec<Value> {
+        self.requests.lock().await.clone()
+    }
+
+    pub async fn request_headers(&self) -> Vec<http::HeaderMap> {
+        self.headers.lock().await.clone()
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn build_response(resp: MockResponse) -> Response {
+    match resp {
+        MockResponse::Json(body) => Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+            .into_response(),
+        MockResponse::Sse(body) => Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+            .into_response(),
+        MockResponse::Status(status, body) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+            .into_response(),
+    }
+}
+
+/// A single queued mock response.
+pub enum MockResponse {
+    Json(String),
+    Sse(String),
+    /// A non-2xx JSON error body, as an upstream returns on failure.
+    Status(u16, String),
+}
+
+impl MockResponse {
+    /// Build a `MockResponse` from a cassette turn.
+    pub fn from_turn(turn: &Turn) -> Self {
+        if let Some(body) = &turn.response.body {
+            return Self::Json(serde_json::to_string(body).expect("cassette body is valid JSON"));
+        }
+        if let Some(sse) = &turn.response.sse {
+            let mut body = sse.join("");
+            // Ensure the stream is terminated.
+            if !body.contains("data: [DONE]") {
+                body.push_str("data: [DONE]\n\n");
+            }
+            return Self::Sse(body);
+        }
+        panic!("cassette turn has neither body nor sse");
+    }
+}
+
+// Use a VecDeque so pop_front is O(1).
+impl MockServer {
+    pub async fn start_deque(responses: Vec<MockResponse>) -> Self {
+        Self::start_deque_on("/v1/responses", responses).await
+    }
+
+    /// Queue responses on an arbitrary upstream route (`/v1/messages` for the
+    /// Messages API); everything else matches [`Self::start_deque`].
+    pub async fn start_deque_on(path: &'static str, responses: Vec<MockResponse>) -> Self {
+        use std::collections::VecDeque;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+        let url = format!("http://{addr}");
+        // Store as VecDeque for O(1) pop_front.
+        let queue: Arc<Mutex<VecDeque<MockResponse>>> = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_route = Arc::clone(&requests);
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let headers_for_route = Arc::clone(&headers);
+
+        let handle = tokio::spawn(async move {
+            let app = Router::new()
+                .route(
+                    path,
+                    post(move |incoming: http::HeaderMap, body: axum::body::Bytes| {
+                        let queue = Arc::clone(&queue);
+                        let requests = Arc::clone(&requests_for_route);
+                        let headers = Arc::clone(&headers_for_route);
+                        async move {
+                            let request_body =
+                                serde_json::from_slice::<Value>(&body).expect("request body should be valid JSON");
+                            requests.lock().await.push(request_body);
+                            headers.lock().await.push(incoming);
+                            let mut q = queue.lock().await;
+                            let resp = q.pop_front().expect("mock queue exhausted — check test setup");
+                            build_response(resp)
+                        }
+                    }),
+                )
+                // Conversation management calls don't go through the mock —
+                // the executor handles them via ConversationHandler (DB-only).
+                // This route is here so the server doesn't return 404 if called.
+                .route(
+                    "/v1/conversations",
+                    post(|| async { (axum::http::StatusCode::OK, "{}") }),
+                );
+            axum::serve(listener, app).await.ok();
+        });
+
+        Self {
+            url,
+            handle,
+            requests,
+            headers,
+        }
+    }
+}
+
+/// Create a fresh `SQLite` pool with schema applied.
+///
+/// Uses a unique temp-file per call so concurrent tests don't conflict.
+pub async fn setup_pool() -> Arc<DbPool> {
+    let db_path = std::env::temp_dir().join(format!("test_{}.db", uuid::Uuid::now_v7()));
+    let db_url = format!("sqlite://{}", db_path.display());
+    create_pool_with_schema(Some(&db_url))
+        .await
+        .expect("failed to create test pool")
+}
+
+/// Bundles everything a test needs.  Dropped at end of test scope.
+pub struct TestFixture {
+    pub exec_ctx: Arc<ExecutionContext>,
+    /// Database behind the handlers, exposed for store-level assertions.
+    pub pool: Arc<DbPool>,
+    // Kept for its Drop impl — aborts the mock server when the test ends.
+    pub server: MockServer,
+}
+
+impl TestFixture {
+    /// Build a fixture from a full cassette turn slice.
+    ///
+    /// The mock server queues only `/v1/responses` turns (LLM inference).
+    /// `/v1/conversations` turns are handled by the executor via
+    /// [`ConversationHandler`] (DB-only, no outbound HTTP).
+    pub async fn new(turns: &[&Turn]) -> Self {
+        let responses = turns
+            .iter()
+            .filter(|t| t.request.path == "/v1/responses")
+            .map(|t| MockResponse::from_turn(t))
+            .collect();
+        let server = MockServer::start_deque(responses).await;
+
+        let pool = setup_pool().await;
+        let conv_handler = ConversationHandler::new(ConversationStore::new(Arc::clone(&pool)));
+        let resp_handler = ResponseHandler::new(ResponseStore::new(Arc::clone(&pool)));
+        let client = Arc::new(reqwest::Client::new());
+        let exec_ctx = Arc::new(ExecutionContext::new(
+            conv_handler,
+            resp_handler,
+            client,
+            server.url().to_string(),
+        ));
+
+        Self { exec_ctx, pool, server }
+    }
+
+    pub async fn new_with_responses(responses: Vec<MockResponse>) -> Self {
+        let server = MockServer::start_deque(responses).await;
+
+        let pool = setup_pool().await;
+        let conv_handler = ConversationHandler::new(ConversationStore::new(Arc::clone(&pool)));
+        let resp_handler = ResponseHandler::new(ResponseStore::new(Arc::clone(&pool)));
+        let client = Arc::new(reqwest::Client::new());
+        let exec_ctx = Arc::new(ExecutionContext::new(
+            conv_handler,
+            resp_handler,
+            client,
+            server.url().to_string(),
+        ));
+
+        Self { exec_ctx, pool, server }
+    }
+
+    pub async fn request_bodies(&self) -> Vec<Value> {
+        self.server.request_bodies().await
+    }
+}
+
+/// How the search backend behind a gateway `web_search` answers.
+#[derive(Clone)]
+pub enum Search {
+    /// One result titled "private search result", a value no span or metric may carry.
+    Answers,
+    /// Every query fails with a 500.
+    Fails,
+    /// Signals that a search arrived, then never answers it.
+    Hangs(Arc<tokio::sync::Notify>),
+}
+
+/// A search backend serving `GET /v1/search`.
+pub async fn search_server(search: Search) -> (String, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new().route(
+        "/v1/search",
+        axum::routing::get(move || {
+            let search = search.clone();
+            async move {
+                match search {
+                    Search::Answers => axum::Json(serde_json::json!({"results": {
+                        "web": [{"url": "https://example.com", "title": "private search result"}],
+                        "news": []
+                    }}))
+                    .into_response(),
+                    Search::Fails => {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "search backend down").into_response()
+                    }
+                    Search::Hangs(arrived) => {
+                        arrived.notify_one();
+                        std::future::pending().await
+                    }
+                }
+            }
+        }),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (url, task)
+}
+
+/// A Messages SSE body: each event framed with its `type` as the event name.
+pub fn messages_sse(events: &[Value]) -> MockResponse {
+    let mut body = String::new();
+    for event in events {
+        writeln!(body, "event: {}\ndata: {event}\n", event["type"].as_str().unwrap()).unwrap();
+    }
+    MockResponse::Sse(body)
+}
+
+/// The `message_start` event that opens an upstream Messages stream.
+pub fn messages_start_event() -> Value {
+    serde_json::json!({"type": "message_start", "message": {
+        "id": "msg_upstream", "type": "message", "role": "assistant", "model": "test-model",
+        "content": [], "stop_reason": null, "stop_sequence": null,
+        "usage": {"input_tokens": 3, "output_tokens": 0}}})
+}
+
+/// A Messages turn that answers "hello" and ends with `stop_reason`.
+pub fn messages_json_response(stop_reason: &str) -> MockResponse {
+    MockResponse::Json(
+        serde_json::json!({
+            "id": "msg_upstream", "type": "message", "role": "assistant", "model": "test-model",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": stop_reason, "stop_sequence": null,
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        })
+        .to_string(),
+    )
+}
+
+/// The streamed form of [`messages_json_response`].
+pub fn messages_sse_response(stop_reason: &str) -> MockResponse {
+    messages_sse(&[
+        messages_start_event(),
+        serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hello"}}),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+            "usage": {"output_tokens": 1}}),
+        serde_json::json!({"type": "message_stop"}),
+    ])
+}
+
+pub fn text_response(text: &str) -> MockResponse {
+    let id_suffix = text.replace(' ', "_");
+    MockResponse::Json(
+        serde_json::json!({
+            "id": format!("resp_upstream_{id_suffix}"),
+            "object": "response",
+            "created_at": 0,
+            "model": "test-model",
+            "status": "completed",
+            "output": [{
+                "id": format!("msg_upstream_{id_suffix}"),
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": []
+                }]
+            }],
+            "usage": null,
+            "incomplete_details": null,
+            "error": null,
+            "previous_response_id": null,
+            "conversation_id": null,
+            "instructions": null
+        })
+        .to_string(),
+    )
+}
+
+/// A minimal SSE response that streams one assistant message and completes.
+pub fn text_sse_response(text: &str) -> MockResponse {
+    let events = [
+        serde_json::json!({
+            "type": "response.created",
+            "response": {"id": "resp_upstream_final", "status": "in_progress", "usage": null}
+        }),
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "msg_upstream_final", "type": "message", "role": "assistant",
+                "status": "in_progress", "content": []
+            }
+        }),
+        serde_json::json!({
+            "type": "response.output_text.delta", "item_id": "msg_upstream_final",
+            "output_index": 0, "content_index": 0, "delta": text
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_upstream_final", "status": "completed", "usage": null}
+        }),
+    ];
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(&serde_json::to_string(&event).expect("event serializes"));
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    MockResponse::Sse(body)
+}
+
+/// A model server whose lifecycle snapshots omit `tools` and `tool_choice` entirely. The
+/// gateway has to report the declarations the client submitted on those frames itself.
+pub fn sse_omitting_tool_declarations(response: MockResponse) -> MockResponse {
+    let MockResponse::Sse(body) = response else {
+        panic!("expected an SSE fixture");
+    };
+    let mut out = String::new();
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            continue;
+        }
+        let mut event: Value = serde_json::from_str(payload).expect("SSE data is JSON");
+        if event["type"] == "response.created" || event["type"] == "response.in_progress" {
+            let response = event["response"].as_object_mut().expect("response object");
+            response.remove("tools");
+            response.remove("tool_choice");
+        }
+        out.push_str("data: ");
+        out.push_str(&serde_json::to_string(&event).expect("event serializes"));
+        out.push_str("\n\n");
+    }
+    out.push_str("data: [DONE]\n\n");
+    MockResponse::Sse(out)
+}
+
+pub fn function_call_response(id: &str, call_id: &str, name: &str, arguments: &str) -> MockResponse {
+    MockResponse::Json(
+        serde_json::json!({
+            "id": format!("resp_upstream_{id}"),
+            "object": "response",
+            "created_at": 0,
+            "model": "test-model",
+            "status": "completed",
+            "output": [{
+                "id": id,
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "status": "completed"
+            }],
+            "usage": null,
+            "incomplete_details": null,
+            "error": null,
+            "previous_response_id": null,
+            "conversation_id": null,
+            "instructions": null
+        })
+        .to_string(),
+    )
+}
+
+pub fn tool_search_function_declarations(name: &str, description: &str) -> Value {
+    serde_json::json!([
+        {
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Find a tool",
+            "parameters": {"type": "object"}
+        },
+        deferred_function_tool(name, description)
+    ])
+}
+
+pub fn deferred_function_tool(name: &str, description: &str) -> Value {
+    serde_json::json!({
+        "type": "function",
+        "name": name,
+        "description": description,
+        "parameters": {"type": "object"},
+        "defer_loading": true
+    })
+}
+
+pub fn tool_search_output(call_id: &str, name: &str, description: &str) -> Value {
+    serde_json::json!({
+        "type": "tool_search_output",
+        "call_id": call_id,
+        "tools": [deferred_function_tool(name, description)]
+    })
+}
+
+pub fn tool_search_request(
+    input: impl Serialize,
+    tools: Option<Value>,
+    store: bool,
+    previous_response_id: Option<String>,
+    conversation_id: Option<String>,
+) -> RequestPayload {
+    let mut request = make_request(input, store, false, previous_response_id, conversation_id);
+    request.tools = tools.map(|tools| serde_json::from_value(tools).expect("valid tool-search declarations"));
+    request.parallel_tool_calls = Some(false);
+    request
+}
+
+pub fn request_input_texts(body: &Value) -> Vec<String> {
+    match &body["input"] {
+        Value::String(text) => vec![text.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match &item["content"] {
+                Value::String(text) => Some(text.clone()),
+                Value::Array(parts) => Some(
+                    parts
+                        .iter()
+                        .filter_map(|part| part["text"].as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn make_request(
+    input: impl Serialize,
+    store: bool,
+    stream: bool,
+    previous_response_id: Option<String>,
+    conversation_id: Option<String>,
+) -> RequestPayload {
+    RequestPayload {
+        model: "test-model".into(),
+        input: serde_json::from_value(serde_json::to_value(input).expect("serialize Responses input"))
+            .expect("request should contain valid Responses input"),
+        previous_response_id,
+        conversation: conversation_id,
+        stream,
+        store,
+        ..Default::default()
+    }
+}
+
+pub fn unwrap_blocking(result: Either<ResponsePayload, BoxStream>) -> ResponsePayload {
+    match result {
+        Either::Left(p) => p,
+        Either::Right(_) => panic!("expected non-streaming response, got stream"),
+    }
+}
+
+/// Collect a streaming response to its final `ResponsePayload`.
+pub async fn collect_stream(result: Either<ResponsePayload, BoxStream>) -> ResponsePayload {
+    let stream = match result {
+        Either::Right(s) => s,
+        Either::Left(_) => panic!("expected streaming response, got blocking"),
+    };
+    let mut stream = Box::pin(stream);
+    while let Some(chunk) = stream.next().await {
+        if let Some(mut event) = streamed_sse_event(&chunk)
+            && event.get("type").and_then(Value::as_str) == Some("response.completed")
+            && let Some(response) = event.get_mut("response")
+            && let Ok(payload) = serde_json::from_value::<ResponsePayload>(response.take())
+        {
+            while stream.next().await.is_some() {}
+            return payload;
+        }
+    }
+    panic!("stream ended without a ResponsePayload chunk");
+}
+
+/// Extract concatenated text content from a `ResponsePayload`.
+pub fn output_text(payload: &ResponsePayload) -> String {
+    payload
+        .output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::Message(msg) => Some(msg.content.iter().map(OutputMessageContent::text).collect::<String>()),
+            OutputItem::FunctionCall(_)
+            | OutputItem::CodeInterpreterCall(_)
+            | OutputItem::ToolSearchCall(_)
+            | OutputItem::ToolSearchOutput(_)
+            | OutputItem::CustomToolCall(_)
+            | OutputItem::ShellCall(_)
+            | OutputItem::FileSearchCall(_)
+            | OutputItem::WebSearchCall(_)
+            | OutputItem::McpCall(_)
+            | OutputItem::McpListTools(_)
+            | OutputItem::Reasoning(_)
+            | OutputItem::Compaction(_)
+            | OutputItem::MultiAgentCall(_)
+            | OutputItem::MultiAgentCallOutput(_)
+            | OutputItem::AgentMessage(_)
+            | OutputItem::Unknown => None,
+        })
+        .collect::<String>()
+}
+
+/// Decodes a request's query string into a JSON object; numeric values become
+/// numbers and repeated keys become arrays, so tests can assert on it directly.
+pub fn query_params_as_json(uri: &axum::http::Uri) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+        let value = if let Ok(number) = value.parse::<u64>() {
+            serde_json::Value::from(number)
+        } else {
+            serde_json::Value::String(value.into_owned())
+        };
+        let key = key.into_owned();
+        match params.remove(&key) {
+            None => {
+                params.insert(key, value);
+            }
+            Some(serde_json::Value::Array(mut values)) => {
+                values.push(value);
+                params.insert(key, serde_json::Value::Array(values));
+            }
+            Some(previous) => {
+                params.insert(key, serde_json::Value::Array(vec![previous, value]));
+            }
+        }
+    }
+    serde_json::Value::Object(params)
+}
+
+/// Persist a turn without a response snapshot.
+pub async fn persist_turn(
+    store: &ConversationStore,
+    conversation_id: &str,
+    response_id: &str,
+    items: Vec<InOutItem>,
+    metadata: &ResponseMetadata,
+) -> StoreResult<()> {
+    let checkpoint = store.rehydrate(conversation_id).await?.checkpoint;
+    store
+        .persist(conversation_id, &checkpoint, response_id, items, None, metadata)
+        .await
+}

@@ -1,0 +1,606 @@
+#[allow(dead_code)]
+mod common;
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::OriginalUri;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use http::{HeaderMap, StatusCode};
+use tokio::net::{TcpListener, TcpSocket};
+use tokio::sync::Mutex;
+
+use common::{spawn_gateway, test_config, test_state};
+
+const CLAUDE_CODE_CACHE_CONTROL_REQUEST: &[u8] =
+    include_bytes!("../../agentic-server-core/tests/fixtures/claude-code-cache-control-request.json");
+
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    uri: String,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+async fn spawn_recording_upstream(
+    status: StatusCode,
+    content_type: &'static str,
+    response_body: &'static str,
+) -> (String, Arc<Mutex<Vec<RecordedRequest>>>, tokio::task::JoinHandle<()>) {
+    spawn_recording_upstream_with_headers(status, content_type, response_body, HeaderMap::new()).await
+}
+
+async fn spawn_recording_upstream_with_headers(
+    status: StatusCode,
+    content_type: &'static str,
+    response_body: &'static str,
+    response_headers: HeaderMap,
+) -> (String, Arc<Mutex<Vec<RecordedRequest>>>, tokio::task::JoinHandle<()>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let route_requests = Arc::clone(&requests);
+    let count_tokens_requests = Arc::clone(&requests);
+    let route_response_headers = response_headers.clone();
+    let app = Router::new()
+        .route(
+            "/v1/messages",
+            post(move |OriginalUri(uri), headers: HeaderMap, body: Bytes| {
+                let route_requests = Arc::clone(&route_requests);
+                let response_headers = route_response_headers.clone();
+                async move {
+                    route_requests.lock().await.push(RecordedRequest {
+                        uri: uri.to_string(),
+                        headers,
+                        body,
+                    });
+                    let mut response = Response::builder()
+                        .status(status)
+                        .header("content-type", content_type)
+                        .body(axum::body::Body::from(response_body))
+                        .unwrap();
+                    response.headers_mut().extend(response_headers);
+                    response.into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(move |OriginalUri(uri), headers: HeaderMap, body: Bytes| {
+                let route_requests = Arc::clone(&count_tokens_requests);
+                let response_headers = response_headers.clone();
+                async move {
+                    route_requests.lock().await.push(RecordedRequest {
+                        uri: uri.to_string(),
+                        headers,
+                        body,
+                    });
+                    let mut response = Response::builder()
+                        .status(status)
+                        .header("content-type", content_type)
+                        .body(axum::body::Body::from(response_body))
+                        .unwrap();
+                    response.headers_mut().extend(response_headers);
+                    response.into_response()
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), requests, handle)
+}
+
+#[tokio::test]
+async fn messages_forwards_raw_body_query_headers_and_open_beta_list() {
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"msg_1"}"#).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"test","tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"WebFetch","description":"Fetch a web page","input_schema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}],"stream":false,"new_field":{"keep":true}}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages?beta=true"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "future-beta-unknown,web-search-2025-03-05")
+        .header("x-claude-code-session-id", "session-1")
+        .header("x-claude-code-agent-id", "agent-1")
+        .header("x-api-key", "anthropic-key")
+        .header("connection", "keep-alive")
+        .header("host", "gateway.invalid")
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), r#"{"id":"msg_1"}"#);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].uri, "/v1/messages?beta=true");
+    assert_eq!(requests[0].body.as_ref(), body);
+    assert_eq!(requests[0].headers["anthropic-version"], "2023-06-01");
+    assert_eq!(
+        requests[0].headers["anthropic-beta"],
+        "future-beta-unknown,web-search-2025-03-05"
+    );
+    assert_eq!(requests[0].headers["x-claude-code-session-id"], "session-1");
+    assert_eq!(requests[0].headers["x-claude-code-agent-id"], "agent-1");
+    assert_eq!(requests[0].headers["x-api-key"], "anthropic-key");
+    assert!(!requests[0].headers.contains_key("connection"));
+    assert_ne!(
+        requests[0].headers.get("host").and_then(|v| v.to_str().ok()),
+        Some("gateway.invalid")
+    );
+}
+
+#[tokio::test]
+async fn messages_forwards_system_attribution_blocks_verbatim() {
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"msg_system"}"#).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"test","system":[{"type":"text","text":"<attribution>session-1</attribution>"},{"type":"text","text":"You are helpful."}],"messages":[{"role":"user","content":"hello"}],"stream":false}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body.as_ref(), body);
+}
+
+#[tokio::test]
+async fn messages_proxy_preserves_claude_code_cache_control_body_verbatim() {
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"msg_cache"}"#).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(CLAUDE_CODE_CACHE_CONTROL_REQUEST.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body.as_ref(), CLAUDE_CODE_CACHE_CONTROL_REQUEST);
+}
+
+#[tokio::test]
+async fn messages_forwards_sse_bytes_unchanged() {
+    let sse = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let (llm_url, _requests, _upstream) = spawn_recording_upstream(StatusCode::OK, "text/event-stream", sse).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(r#"{"model":"test","stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert_eq!(response.bytes().await.unwrap().as_ref(), sse.as_bytes());
+}
+
+#[tokio::test]
+async fn messages_count_tokens_uses_matching_upstream_path() {
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"input_tokens":3}"#).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages/count_tokens"))
+        .body(r#"{"model":"test","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), r#"{"input_tokens":3}"#);
+    assert_eq!(requests.lock().await[0].uri, "/v1/messages/count_tokens");
+}
+
+#[tokio::test]
+async fn messages_preserves_upstream_error_status_and_body() {
+    let (llm_url, _requests, _upstream) = spawn_recording_upstream(
+        StatusCode::BAD_REQUEST,
+        "application/json",
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+    )
+    .await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.text().await.unwrap(),
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#
+    );
+}
+
+#[tokio::test]
+async fn messages_gateway_loop_preserves_upstream_error_status_and_body() {
+    let upstream_error = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad thinking field"}}"#;
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert("request-id", "req_error".parse().unwrap());
+    upstream_headers.insert("retry-after", "7".parse().unwrap());
+    let (llm_url, _requests, _upstream) = spawn_recording_upstream_with_headers(
+        StatusCode::BAD_REQUEST,
+        "application/json",
+        upstream_error,
+        upstream_headers,
+    )
+    .await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":false,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["request-id"], "req_error");
+    assert_eq!(response.headers()["retry-after"], "7");
+    assert_eq!(response.text().await.unwrap(), upstream_error);
+}
+
+#[tokio::test]
+async fn messages_gateway_stream_preserves_initial_upstream_error_status_and_body() {
+    let upstream_error =
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"unsupported adaptive thinking"}}"#;
+    let (llm_url, _requests, _upstream) =
+        spawn_recording_upstream(StatusCode::BAD_REQUEST, "application/json", upstream_error).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.text().await.unwrap(), upstream_error);
+}
+
+/// An upstream URL that refuses connections. The socket stays bound without listening, so a server from a test
+/// running in parallel cannot take the port while the returned socket is alive.
+fn refused_upstream() -> (TcpSocket, String) {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let url = format!("http://{}", socket.local_addr().unwrap());
+    (socket, url)
+}
+
+#[tokio::test]
+async fn messages_returns_anthropic_error_for_unreachable_upstream() {
+    let (_reserved, dead_url) = refused_upstream();
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&dead_url))).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "LLM unavailable",
+            },
+        })
+    );
+}
+
+#[tokio::test]
+async fn messages_gateway_loop_returns_anthropic_error_for_unreachable_upstream() {
+    let (_reserved, dead_url) = refused_upstream();
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&dead_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":false,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "LLM unavailable",
+            },
+        })
+    );
+}
+
+/// Mock vLLM `/v1/messages` that returns a canned Anthropic message and records
+/// how many times it was called (to prove routing).
+async fn spawn_mock_vllm_messages(body: &'static str) -> (String, Arc<Mutex<usize>>, tokio::task::JoinHandle<()>) {
+    let calls = Arc::new(Mutex::new(0usize));
+    let route_calls = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |_body: Bytes| {
+            let route_calls = Arc::clone(&route_calls);
+            async move {
+                *route_calls.lock().await += 1;
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+                    .into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls, handle)
+}
+
+// A request declaring a gateway-owned `web_search` tool routes to the native
+// loop (hits vLLM /v1/messages) and returns an Anthropic message. The model
+// answers directly here (end_turn) so no search backend is needed.
+#[tokio::test]
+async fn messages_with_web_search_tool_routes_to_native_loop() {
+    let final_msg = r#"{"id":"m","type":"message","role":"assistant","model":"qwen3","content":[{"type":"text","text":"Rust 1.89.0."}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3}}"#;
+    let (llm_url, calls, _upstream) = spawn_mock_vllm_messages(final_msg).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":false,"messages":[{"role":"user","content":"latest rust?"}],"tools":[{"name":"web_search","description":"s","input_schema":{"type":"object","properties":{"query":{"type":"string"}}}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The loop called vLLM /v1/messages upstream (native, not the Responses path).
+    assert_eq!(*calls.lock().await, 1, "native loop should call /v1/messages");
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(json["type"], "message");
+    assert_eq!(json["role"], "assistant");
+    assert_eq!(json["content"][0]["text"], "Rust 1.89.0.");
+    assert_eq!(json["stop_reason"], "end_turn");
+}
+
+#[tokio::test]
+async fn messages_gateway_loop_forwards_query_and_open_headers() {
+    let final_msg = r#"{"id":"m","type":"message","role":"assistant","model":"qwen3","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":1}}"#;
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert("request-id", "req_terminal".parse().unwrap());
+    upstream_headers.insert("anthropic-ratelimit-requests-remaining", "41".parse().unwrap());
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream_with_headers(StatusCode::OK, "application/json", final_msg, upstream_headers).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":false,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages?beta=true"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "future-beta-unknown,interleaved-thinking-2025-05-14")
+        .header("x-claude-code-session-id", "session-loop")
+        .header("x-claude-code-agent-id", "agent-loop")
+        .header("x-api-key", "anthropic-key")
+        .header("accept-encoding", "gzip")
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["request-id"], "req_terminal");
+    assert_eq!(response.headers()["anthropic-ratelimit-requests-remaining"], "41");
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].uri, "/v1/messages?beta=true");
+    assert_eq!(requests[0].headers["anthropic-version"], "2023-06-01");
+    assert_eq!(
+        requests[0].headers["anthropic-beta"],
+        "future-beta-unknown,interleaved-thinking-2025-05-14"
+    );
+    assert_eq!(requests[0].headers["x-claude-code-session-id"], "session-loop");
+    assert_eq!(requests[0].headers["x-claude-code-agent-id"], "agent-loop");
+    assert_eq!(requests[0].headers["x-api-key"], "anthropic-key");
+    assert!(!requests[0].headers.contains_key("accept-encoding"));
+    assert!(!requests[0].headers.contains_key("authorization"));
+}
+
+#[tokio::test]
+async fn messages_gateway_stream_forwards_query_and_open_headers() {
+    let final_sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"qwen3\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert("request-id", "req_stream".parse().unwrap());
+    upstream_headers.insert("anthropic-ratelimit-tokens-remaining", "900".parse().unwrap());
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream_with_headers(StatusCode::OK, "text/event-stream", final_sse, upstream_headers).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages?beta=true"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "future-beta-unknown")
+        .header("x-claude-code-session-id", "session-stream")
+        .header("x-api-key", "anthropic-key")
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["request-id"], "req_stream");
+    assert_eq!(response.headers()["anthropic-ratelimit-tokens-remaining"], "900");
+    assert!(response.text().await.unwrap().contains("done"));
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].uri, "/v1/messages?beta=true");
+    assert_eq!(requests[0].headers["anthropic-version"], "2023-06-01");
+    assert_eq!(requests[0].headers["anthropic-beta"], "future-beta-unknown");
+    assert_eq!(requests[0].headers["x-claude-code-session-id"], "session-stream");
+    assert_eq!(requests[0].headers["x-api-key"], "anthropic-key");
+}
+
+// A request with NO gateway-owned tool stays on the transparent proxy — the
+// native loop is never engaged.
+#[tokio::test]
+async fn messages_without_gateway_tool_uses_proxy() {
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"proxied"}"#).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    // A custom (client-owned) tool only — not gateway-owned.
+    let body = br#"{"model":"qwen3","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"get_weather","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // Proxied verbatim (the recording upstream echoes the raw body path).
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body.as_ref(), body);
+}
+
+#[tokio::test]
+async fn messages_provider_tools_preserve_proxy_body_and_stream_events() {
+    for stream in [false, true] {
+        let (content_type, upstream_body) = if stream {
+            (
+                "text/event-stream",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )
+        } else {
+            (
+                "application/json",
+                r#"{"id":"proxied","content":[],"stop_reason":"end_turn"}"#,
+            )
+        };
+        let (llm_url, requests, upstream) = spawn_recording_upstream(StatusCode::OK, content_type, upstream_body).await;
+        let (gateway_url, gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model":"qwen3","max_tokens":64,"stream":stream,
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[
+                {"type":"future_tool_20990101","name":"hosted","cache_control":{"type":"ephemeral"},
+                 "future":{"nested":[null,true,42]}},
+                {"name":"web_fetch","input_schema":{"type":"object"}}
+            ]
+        }))
+        .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_url}/v1/messages"))
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with(content_type)
+        );
+        assert_eq!(response.text().await.unwrap(), upstream_body);
+        {
+            let requests = requests.lock().await;
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].body.as_ref(), body);
+        }
+        gateway.abort();
+        upstream.abort();
+        let _ = gateway.await;
+        let _ = upstream.await;
+    }
+}
+
+#[tokio::test]
+async fn gateway_messages_reject_invalid_selectors_before_inference() {
+    let (llm_url, requests, upstream) =
+        spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"unexpected"}"#).await;
+    let (gateway_url, gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    for stream in [false, true] {
+        for choice in [
+            serde_json::json!([]),
+            serde_json::json!(true),
+            serde_json::json!("any"),
+            serde_json::json!({}),
+            serde_json::json!({"type":false}),
+            serde_json::json!({"type":"future"}),
+            serde_json::json!({"type":"tool"}),
+            serde_json::json!({"type":"tool", "name":""}),
+            serde_json::json!({"type":"tool", "name":42}),
+            serde_json::json!({"type":"any", "disable_parallel_tool_use":"true"}),
+        ] {
+            let request = serde_json::json!({"model":"test", "max_tokens":64, "stream":stream,
+                "messages":[{"role":"user", "content":"hi"}],
+                "tools":[{"name":"web_search", "input_schema":{"type":"object"}}],
+                "tool_choice":choice});
+            let response = reqwest::Client::new()
+                .post(format!("{gateway_url}/v1/messages"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{choice}, stream={stream}");
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+        }
+    }
+    assert!(
+        requests.lock().await.is_empty(),
+        "invalid selectors must not bypass the loop through proxying"
+    );
+    gateway.abort();
+    upstream.abort();
+    let _ = gateway.await;
+    let _ = upstream.await;
+}

@@ -1,0 +1,135 @@
+turns:
+- filename: t1
+  request:
+    body:
+      input: Call mcp__counter__say_hello exactly once with {}. Do not call any other
+        tool. Return exactly MCP_SAYS=hello.
+      max_output_tokens: 4096
+      model: Qwen/Qwen3.5-35B-A3B-FP8
+      store: true
+      stream: false
+      tool_choice: required
+      tools:
+      - allowed_tools:
+        - say_hello
+        require_approval: never
+        server_label: counter
+        server_url: https://bear-impact-devel-venture.trycloudflare.com/mcp
+        type: mcp
+    headers:
+      accept: '*/*'
+      content-type: application/json
+      user-agent: python-httpx/0.28.1
+    method: POST
+    path: /v1/responses
+    query_params: {}
+  response:
+    body:
+      background: false
+      completed_at: 1792389915
+      created_at: 1792389915
+      error: null
+      frequency_penalty: 0.0
+      id: resp_01a152c3-9c0b-7851-986b-6c6652d71681
+      incomplete_details: null
+      instructions: null
+      max_output_tokens: 4096
+      max_tool_calls: null
+      metadata: {}
+      model: Qwen/Qwen3.5-35B-A3B-FP8
+      object: response
+      output:
+      - id: mcpl_01a152c3-9d3e-7643-a186-d20c1320ef4a
+        server_label: counter
+        tools:
+        - annotations:
+            read_only: false
+          description: Say hello to the client
+          input_schema:
+            properties: {}
+            type: object
+          name: say_hello
+        type: mcp_list_tools
+      - content:
+        - text: 'The user wants me to:
+
+            1. Call the mcp__counter__say_hello function exactly once with {} (empty
+            parameters)
+
+            2. Not call any other tool
+
+            3. Return exactly "MCP_SAYS=hello"
+
+
+            I need to make the function call and then return the specified text. Let
+            me call the function first.
+
+            '
+          type: reasoning_text
+        id: rs_8f0a032851b5b98c
+        summary: []
+        type: reasoning
+      - approval_request_id: null
+        arguments: '{"parameters": "{}"}'
+        error: null
+        id: mcp_8d0abfb40bd3def1
+        name: say_hello
+        output: hello
+        server_label: counter
+        status: completed
+        type: mcp_call
+      - content:
+        - text: 'Great, the function was called successfully and returned "hello".
+            Now I need to return exactly "MCP_SAYS=hello" as specified by the user.
+
+            '
+          type: reasoning_text
+        id: rs_bee1d1d6f2f6bccd
+        summary: []
+        type: reasoning
+      - content:
+        - annotations: []
+          text: '
+
+
+            MCP_SAYS=hello'
+          type: output_text
+        id: msg_aa36de9de7dcacd1
+        role: assistant
+        status: completed
+        type: message
+      parallel_tool_calls: false
+      presence_penalty: 0.0
+      previous_response_id: null
+      prompt_cache_key: null
+      reasoning: null
+      safety_identifier: null
+      service_tier: auto
+      status: completed
+      store: true
+      temperature: 1.0
+      text:
+        format:
+          type: text
+      tool_choice: required
+      tools:
+      - allowed_tools:
+        - say_hello
+        require_approval: never
+        server_label: counter
+        server_url: https://bear-impact-devel-venture.trycloudflare.com/mcp
+        type: mcp
+      top_logprobs: 0
+      top_p: 1.0
+      truncation: disabled
+      usage:
+        input_tokens: 746
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: 145
+        output_tokens_details:
+          reasoning_tokens: 0
+        total_tokens: 891
+    headers:
+      content-type: application/json
+    status_code: 200

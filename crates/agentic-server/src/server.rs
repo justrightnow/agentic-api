@@ -1,0 +1,366 @@
+use std::future::{Future, IntoFuture};
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use agentic_core::config::Config;
+use agentic_core::error::Error as CoreError;
+use agentic_core::executor::ExecutionContext;
+use agentic_core::proxy::ProxyState;
+use agentic_core::readiness::{llm_readiness_client, wait_llm_ready};
+use agentic_server::app::{
+    AppState, ReadinessTracker, ServerConfig, WebSocketTracker, build_router_with_auth, gateway_listener,
+};
+use agentic_server::auth::{OidcAuthError, OidcAuthenticator, OidcConfig};
+use agentic_server::model_capabilities::ModelCapabilities;
+use agentic_server::rate_limit::RateLimitConfig;
+use agentic_server::telemetry::TelemetryError;
+use tokio::{net::TcpListener, task::JoinSet};
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+const GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+const FILE_BLOB_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Transport-level gateway settings resolved before the server starts.
+///
+/// These are deliberately separate from [`Config`], which carries inference,
+/// storage, and tool concerns that core owns.
+pub struct GatewayOptions<'a> {
+    pub model_capabilities: ModelCapabilities,
+    pub host: &'a str,
+    pub port: u16,
+    /// Ceiling on serialized inbound request bytes for HTTP bodies and
+    /// WebSocket messages and frames.
+    pub max_request_body_size: NonZeroUsize,
+    /// Per-caller request rate; `None` disables rate limiting.
+    pub rate_limit: Option<RateLimitConfig>,
+    pub oidc: Option<OidcConfig>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error(transparent)]
+    Core(#[from] CoreError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("failed to initialize OIDC authentication: {0}")]
+    Oidc(#[source] OidcAuthError),
+    #[error("failed to initialize telemetry: {0}")]
+    Telemetry(#[from] TelemetryError),
+}
+
+impl From<OidcAuthError> for ServerError {
+    fn from(error: OidcAuthError) -> Self {
+        Self::Oidc(error)
+    }
+}
+
+async fn build_state(
+    config: &Config,
+    shutdown_token: CancellationToken,
+    max_request_body_size: NonZeroUsize,
+    model_capabilities: ModelCapabilities,
+) -> Result<AppState, ServerError> {
+    let proxy_state = ProxyState::new(config.clone())?;
+    let exec_ctx = Arc::new(ExecutionContext::from_config(config).await?);
+
+    Ok(AppState {
+        proxy_state,
+        exec_ctx,
+        llm_readiness_client: llm_readiness_client()?,
+        readiness_tracker: ReadinessTracker::default(),
+        shutdown_token,
+        websocket_tracker: WebSocketTracker::default(),
+        llm_api_base: config.llm_api_base.clone(),
+        skip_llm_ready_check: config.skip_llm_ready_check,
+        openai_api_key: config.openai_api_key.clone(),
+        max_request_body_size,
+        model_capabilities: Arc::new(model_capabilities),
+    })
+}
+
+async fn serve_gateway(
+    state: AppState,
+    host: &str,
+    port: u16,
+    authenticator: Option<OidcAuthenticator>,
+    rate_limit: Option<RateLimitConfig>,
+) -> Result<(), ServerError> {
+    let addr = format!("{host}:{port}");
+    let server_config = ServerConfig {
+        rate_limit,
+        ..ServerConfig::from_env()
+    };
+    let shutdown_token = state.shutdown_token.clone();
+    let websocket_tracker = state.websocket_tracker.clone();
+    let messages_threads = state.exec_ctx.messages_threads.clone();
+    let shutdown_on_error = shutdown_token.clone();
+    let cleanup_service = state.exec_ctx.file_search.clone();
+    let router = build_router_with_auth(state, &server_config, authenticator);
+    let listener = TcpListener::bind(&addr).await?;
+    let addr = listener.local_addr()?;
+    info!("gateway listening on {addr}");
+    let mut cleanup_workers = JoinSet::new();
+    if let Some(service) = cleanup_service {
+        let cleanup_shutdown = shutdown_token.clone();
+        cleanup_workers.spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + FILE_BLOB_CLEANUP_INTERVAL,
+                FILE_BLOB_CLEANUP_INTERVAL,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cleanup_shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = service.reconcile_blob_cleanup().await {
+                            warn!(%error, "file blob reconciliation failed; will retry");
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // Rate limiting tells callers apart by peer address when OIDC is off.
+    let server = axum::serve(
+        gateway_listener(listener),
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_token.cancelled().await;
+    })
+    .into_future();
+    tokio::pin!(server);
+    let maintenance = async {
+        let mut expiry = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            expiry.tick().await;
+            if let Err(error) = messages_threads.maintain().await {
+                tracing::error!(%error, "Messages thread maintenance failed");
+            }
+        }
+    };
+    let result = tokio::select! {
+        result = &mut server => result,
+        () = maintenance => Ok(()),
+    };
+    if result.is_err() {
+        shutdown_on_error.cancel();
+    }
+    // JoinSet aborts its tasks if this server future is dropped early. On a
+    // normal exit, abort and join the periodic worker before returning.
+    cleanup_workers.abort_all();
+    while let Some(joined) = cleanup_workers.join_next().await {
+        if let Err(error) = joined
+            && !error.is_cancelled()
+        {
+            warn!(%error, "file blob reconciliation worker failed");
+        }
+    }
+    websocket_tracker.wait_until_idle().await;
+    messages_threads.shutdown().await;
+    result?;
+    Ok(())
+}
+
+async fn serve_gateway_until_signal(
+    state: AppState,
+    host: &str,
+    port: u16,
+    authenticator: Option<OidcAuthenticator>,
+    rate_limit: Option<RateLimitConfig>,
+) -> Result<(), ServerError> {
+    let shutdown_token = state.shutdown_token.clone();
+    let gateway = serve_gateway(state, host, port, authenticator, rate_limit);
+    tokio::pin!(gateway);
+
+    tokio::select! {
+        result = &mut gateway => result,
+        () = shutdown_signal()? => {
+            info!("shutdown signal received");
+            shutdown_token.cancel();
+            drain_gateway(gateway.as_mut()).await
+        }
+    }
+}
+
+async fn drain_gateway<F>(gateway: Pin<&mut F>) -> Result<(), ServerError>
+where
+    F: Future<Output = Result<(), ServerError>>,
+{
+    if let Ok(result) = tokio::time::timeout(GATEWAY_DRAIN_TIMEOUT, gateway).await {
+        result
+    } else {
+        warn!(
+            timeout_seconds = GATEWAY_DRAIN_TIMEOUT.as_secs(),
+            "gateway drain timed out; closing remaining connections"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn shutdown_signal() -> Result<impl Future<Output = ()>, std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = terminate.recv() => {},
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> Result<impl Future<Output = ()>, std::io::Error> {
+    let mut interrupt = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        interrupt.recv().await;
+    })
+}
+
+async fn wait_until_llm_ready(config: &Config) -> Result<(), ServerError> {
+    if config.skip_llm_ready_check {
+        info!("skipping LLM readiness check: {}", config.llm_api_base);
+        return Ok(());
+    }
+
+    wait_llm_ready(config).await?;
+    info!("LLM ready: {}", config.llm_api_base);
+    Ok(())
+}
+
+/// Start the gateway after the LLM becomes ready.
+///
+/// # Errors
+///
+/// Returns an error if OIDC discovery or verification-key loading, DB
+/// initialisation, LLM readiness polling, or the server binding fails.
+pub async fn run(config: Config, gateway: GatewayOptions<'_>) -> Result<(), ServerError> {
+    let GatewayOptions {
+        host,
+        port,
+        max_request_body_size,
+        rate_limit,
+        oidc,
+        model_capabilities,
+    } = gateway;
+    let authenticator = match oidc {
+        Some(oidc) => Some(OidcAuthenticator::discover(oidc).await?),
+        None => None,
+    };
+    wait_until_llm_ready(&config).await?;
+    let state = build_state(
+        &config,
+        CancellationToken::new(),
+        max_request_body_size,
+        model_capabilities,
+    )
+    .await?;
+    serve_gateway_until_signal(state, host, port, authenticator, rate_limit).await
+}
+
+/// Spawn vLLM as a subprocess and run the gateway in the foreground.
+///
+/// # Errors
+///
+/// Returns an error if OIDC discovery or verification-key loading fails, vLLM
+/// fails to start, DB initialisation fails, or the gateway errors.
+pub async fn run_with_llm(
+    config: Config,
+    gateway: GatewayOptions<'_>,
+    llm_args: Vec<String>,
+) -> Result<(), ServerError> {
+    let GatewayOptions {
+        host,
+        port,
+        max_request_body_size,
+        rate_limit,
+        oidc,
+        model_capabilities,
+    } = gateway;
+    let authenticator = match oidc {
+        Some(oidc) => Some(OidcAuthenticator::discover(oidc).await?),
+        None => None,
+    };
+    // Register signal handlers before spawning the owned subprocess, and
+    // retain the same listener across startup and serving so no signal is lost.
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
+    let mut cmd = tokio::process::Command::new("python");
+    cmd.arg("-m").arg("vllm.entrypoints.openai.api_server");
+    cmd.args(&llm_args);
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn()?;
+    info!("spawned vLLM subprocess (pid {})", child.id().unwrap_or(0));
+
+    let shutdown_token = CancellationToken::new();
+    let result = async {
+        let state = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                info!("shutdown signal received during startup");
+                return Ok(());
+            }
+            status = child.wait() => {
+                let status = status?;
+                return Err(ServerError::from(CoreError::LlmProcessExited { status: status.to_string() }));
+            }
+            state = async {
+                wait_until_llm_ready(&config).await?;
+                build_state(&config, shutdown_token.clone(), max_request_body_size, model_capabilities).await
+            } => state?,
+        };
+
+        let gateway = serve_gateway(state, host, port, authenticator, rate_limit);
+        tokio::pin!(gateway);
+
+        tokio::select! {
+            gateway = &mut gateway => gateway,
+            status = child.wait() => {
+                shutdown_token.cancel();
+                let status = status?;
+                Err(ServerError::from(CoreError::LlmProcessExited { status: status.to_string() }))
+            },
+            () = &mut shutdown => {
+                info!("shutdown signal received");
+                shutdown_token.cancel();
+                drain_gateway(gateway.as_mut()).await
+            }
+        }
+    }
+    .await;
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerError, drain_gateway};
+    use agentic_core::error::Error as CoreError;
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_drain_is_bounded() {
+        let gateway = std::future::pending::<Result<(), ServerError>>();
+        tokio::pin!(gateway);
+
+        drain_gateway(gateway.as_mut()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_drain_preserves_server_errors() {
+        let gateway = std::future::ready(Err(ServerError::from(CoreError::Config("gateway failed".to_owned()))));
+        tokio::pin!(gateway);
+
+        let error = drain_gateway(gateway.as_mut()).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "gateway failed");
+    }
+}

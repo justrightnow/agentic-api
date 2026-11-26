@@ -1,0 +1,135 @@
+turns:
+- filename: t1
+  request:
+    body:
+      input: Use web search to search for the exact query "potato", then summarize
+        the result in one sentence.
+      max_output_tokens: 1024
+      model: Qwen/Qwen3.5-35B-A3B-FP8
+      store: true
+      stream: false
+      tool_choice: auto
+      tools:
+      - type: web_search_preview
+    headers:
+      accept: '*/*'
+      content-type: application/json
+      user-agent: python-httpx/0.28.1
+    method: POST
+    path: /v1/responses
+    query_params: {}
+  response:
+    body:
+      background: false
+      completed_at: 1792381882
+      created_at: 1792381882
+      error: null
+      frequency_penalty: 0.0
+      id: resp_01a15249-0a2b-73e0-8138-67d707ac5544
+      incomplete_details: null
+      instructions: null
+      max_output_tokens: 1024
+      max_tool_calls: null
+      metadata: {}
+      model: Qwen/Qwen3.5-35B-A3B-FP8
+      object: response
+      output:
+      - content:
+        - text: 'The user wants me to search for the exact query "potato" and summarize
+            the results in one sentence. This is a simple web search task. Let me
+            perform the search first.
+
+            '
+          type: reasoning_text
+        id: rs_8c2eb0a983789b59
+        summary: []
+        type: reasoning
+      - action:
+          queries:
+          - potato
+          query: potato
+          sources:
+          - title: Potato - Wikipedia
+            url: https://en.wikipedia.org/wiki/Potato
+          - title: Potato Facts
+            url: https://www.idahopotatomuseum.com/potato-facts/
+          - title: Potatoes | Potato Nutrition | Types of Potatoes | Recipes
+            url: https://potatogoodness.com/
+          - title: Understanding Potatoes
+            url: https://www.thechoppingblock.com/blog/understanding-potatoes
+          - title: Idaho Potato Commission
+            url: https://idahopotato.com/
+          - title: Potato | Vegetable, Tuber, Nutrition, Diseases, Origin, & Facts
+              ...
+            url: https://www.britannica.com/plant/potato
+          - title: Growing Potatoes in a Home Garden | University of Maryland Extension
+            url: https://extension.umd.edu/resource/growing-potatoes-home-garden
+          - title: Potato
+            url: https://www.shawarmahatem.com/product/potato/potato/
+          - title: Potato | Good Eats | Fandom
+            url: https://goodeats.fandom.com/wiki/Potato
+          - title: The Best Crispy Roast Potatoes Ever Recipe
+            url: https://www.seriouseats.com/the-best-roast-potatoes-ever-recipe
+          type: search
+        id: ws_9c9d0990e06ff3cd
+        status: completed
+        type: web_search_call
+      - content:
+        - text: 'I got the search results for "potato". Now I need to summarize them
+            in one sentence. The results show that potatoes are a starchy tuber vegetable
+            native to the Americas, specifically the Peruvian-Bolivian Andes, and
+            have been cultivated for thousands of years, becoming a staple food worldwide
+            with thousands of varieties.
+
+            '
+          type: reasoning_text
+        id: rs_86cafb9b8ba72e6c
+        summary: []
+        type: reasoning
+      - content:
+        - annotations: []
+          text: '
+
+
+            The potato is a starchy tuberous vegetable native to the Andes region
+            of South America (specifically Peru and Bolivia) that has been cultivated
+            for over 7,000 years and is now one of the world''s most important staple
+            foods with over 5,000 varieties grown across 125 countries.'
+          type: output_text
+        id: msg_b5eaec68d6637532
+        role: assistant
+        status: completed
+        type: message
+      parallel_tool_calls: false
+      presence_penalty: 0.0
+      previous_response_id: null
+      prompt_cache_key: null
+      reasoning: null
+      safety_identifier: null
+      service_tier: auto
+      status: completed
+      store: true
+      temperature: 1.0
+      text:
+        format:
+          type: text
+      tool_choice: auto
+      tools:
+      - filters: null
+        search_context_size: null
+        type: web_search_preview
+        user_location: null
+      top_logprobs: 0
+      top_p: 1.0
+      truncation: disabled
+      usage:
+        input_tokens: 4102
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: 203
+        output_tokens_details:
+          reasoning_tokens: 0
+        total_tokens: 4305
+    headers:
+      content-type: application/json
+    status_code: 200
